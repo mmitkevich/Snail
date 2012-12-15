@@ -70,10 +70,6 @@
       <Project>{37FBDBE1-8524-4489-B082-CC109B0F5EA3}</Project>
       <Name>Disruptor</Name>
     </ProjectReference>
-    <ProjectReference Include="..\..\..\..\NET\Perst4.NET\Perst.NET.csproj">
-      <Project>{1FF2E6AE-B540-4EA9-BD18-5F077EE61291}</Project>
-      <Name>Perst.NET</Name>
-    </ProjectReference>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>

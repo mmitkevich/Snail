@@ -1,12 +1,5 @@
-﻿using System;
-using System.IO;
-using System.Linq.Expressions;
-using Perst.Impl;
-
-namespace Snail.Compression
+﻿namespace Snail.Compression
 {
-	using Perst;
-	using System.Collections.Generic;
 
 	public interface ICompressedBlock
 	{
