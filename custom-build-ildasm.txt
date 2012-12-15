@@ -1,0 +1,5 @@
+set target=$(TargetPath)
+set sdk=$(FrameworkSDKDir)
+set project=$(ProjectPath)
+set framework=$(MSBuildBinPath)
+"d:\NET\InlineILCompiler.exe"

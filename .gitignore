@@ -1,0 +1,11 @@
+_ReSharper*/
+Release/
+Debug/
+bin/
+obj/
+*.user
+*.suo
+*.opensdf
+*.testsettings
+*.sdf
+*.dgml
