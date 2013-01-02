@@ -3,6 +3,15 @@
 #define STRU_C8
 #define STRU_REF
 
+//#define NOP
+//#define CYCLE
+#define CS
+#define SAFE
+//#define PTR
+#define READ
+#define WRITE
+#define RW
+
 using System;
 using System.Runtime.InteropServices;
 using Snail.Threading;
@@ -12,7 +21,8 @@ namespace Snail.Tests.Threading
 	class ArgsBufferTests
 	{
 
-		public static int COUNT = 4 * 1024 * 1024;
+		public static int COUNT = 16 * 1024 * 1024;
+		public static int SIZE = 8*1024;
 		public static int MaxAddr = 0;
 		[StructLayout(LayoutKind.Sequential)]
 		public struct StructTest
@@ -59,49 +69,42 @@ namespace Snail.Tests.Threading
 			_q++;
 		}
 
-		private class StructArray
+		private class TArray<T>
 		{
-			private static StructTest[] _stru;
-			public StructArray(int count)
+			private static T[] _stru;
+			public TArray(int count)
 			{
-				_stru = new StructTest[count];
+				_stru = new T[count];
 			}
 
-			public int Write(int i, ref StructTest stru)
+			public int Write(int i, ref T stru)
 			{
 				_stru[i] = stru;
-				return i + 1;
+				return i + 1>=_stru.Length?0:i+1;
 			}
 
-			public int Read(int i, ref StructTest v)
+			public int Read(int i, ref T v)
 			{
 				v = _stru[i];
-				return i + 1;
+				return i + 1 >= _stru.Length ? 0 : i + 1;
 			}
 		}
-
-		private static int[] _arr = new int[2];
-		public static int Copy(int i, ref int v)
-		{
-			_arr[1] = v;
-			return i + 1;
-		}
-
-		private static StructArray struArr;
+		private static TArray<StructTest> struArr;
+		private static TArray<int> _arr;
 		private static ArgsBuffer ab;
 		private static int sz;
 		public static void test()
 		{
-			sz = ArgsBuffer.SizeOf<int>();
+			sz = ByteArrayUtils.SizeOf<int>();
 #if STRU
-			sz = ArgsBuffer.SizeOf<StructTest>();
+			sz = ByteArrayUtils.SizeOf<StructTest>();
 #endif
-			MaxAddr = COUNT * sz;
+			MaxAddr = SIZE * sz;
 
 
-			struArr = new StructArray(COUNT);
-			ab = new ArgsBuffer(MaxAddr);
-
+			struArr = new TArray<StructTest>(SIZE);
+			_arr = new TArray<int>(SIZE);
+			ab = new ArgsBuffer(SIZE, sz);
 			for (int i = 0; i < 3; i++)
 				test1();
 		}
@@ -112,33 +115,37 @@ namespace Snail.Tests.Threading
 
 
 			Report rpt;
-			rpt = new Report("CYCLE.NOP n=" + COUNT, "", "sz=" + sz);
-			rpt.Run(COUNT, () =>
+#if CYCLE
+			rpt = new Report("CYCLE.NOP n=" + SIZE, "", "sz=" + sz);
+			rpt.Run(SIZE, () =>
 			{
 				int q = 0;
-				for (int i = 0; i < COUNT; i++)
+				for (int i = 0; i < SIZE; i++)
 				{
 					q++;
 				}
 			});
 			Console.WriteLine(rpt);
-
-			rpt = new Report("NOP n=" + COUNT, "", "sz=" + sz);
-			rpt.Run(COUNT, () =>
+#endif
+#if NOP
+			rpt = new Report("NOP n=" + SIZE, "", "sz=" + sz);
+			rpt.Run(SIZE, () =>
 			{
-				for (int i = 0; i < COUNT; i++)
+				for (int i = 0; i < SIZE; i++)
 					NOP();
 			});
 			Console.WriteLine(rpt);
+#endif
+#if CS 
+#if WRITE
+			rpt = new Report("WRITE.C# n=" + SIZE, "", "sz=" + sz);
 
-			rpt = new Report("WRITE.C# n=" + COUNT, "", "sz=" + sz);
-
-			rpt.Run(COUNT, () =>
+			rpt.Run(SIZE, () =>
 			{
 				StructTest stru = new StructTest();
 				int p = 0;
 				int vi = 0;
-				for (int i = 0; i < COUNT; i++)
+				for (int i = 0; i < SIZE; i++)
 				{
 #if STRU	
 					stru.Fill(i, ab); 
@@ -149,13 +156,15 @@ namespace Snail.Tests.Threading
 				}
 			});
 			Console.WriteLine(rpt);
+#endif
+#if READ
 			rpt = new Report("READ.C#", "Unsafe", "");
-			rpt.Run(COUNT, () =>
+			rpt.Run(SIZE, () =>
 			{
 				StructTest stru = new StructTest();
 				int p = 0;
 				int v = 0;
-				for (int i = 0; i < COUNT; i++)
+				for (int i = 0; i < SIZE; i++)
 				{
 #if STRU
 					p = struArr.Read(p, ref stru);
@@ -170,15 +179,44 @@ namespace Snail.Tests.Threading
 				}
 			});
 			Console.WriteLine(rpt);
-
-			rpt = new Report("WRITE.SAFE n=" + COUNT, "", "sz=" + sz);
+#endif
+#if RW
+			rpt = new Report("READ/WRITE.C# n=" + SIZE, "", "sz=" + sz);
 
 			rpt.Run(COUNT, () =>
 			{
 				StructTest stru = new StructTest();
-				int i = 0;
-				int p;
-				for (p = 0; p < ab.Length; )
+				int p = 0,pr=0;
+				int vi = 0;
+				for (int i = 0; i < COUNT; i++)
+				{
+#if STRU
+					stru.Fill(i, ab);
+					p = struArr.Write(p, ref stru);
+					pr = struArr.Read(pr, ref stru);
+					if (!stru.Check(i, ab))
+						throw new InvalidOperationException();
+#elif true
+					vi = i;
+					p = _arr.Write(p, ref vi);
+					pr = _arr.Read(pr, ref vi);
+					if (vi != i)
+						throw new InvalidOperationException();
+#endif
+				}
+			});
+			Console.WriteLine(rpt);
+#endif
+#endif
+#if SAFE
+#if WRITE
+			rpt = new Report("WRITE.SAFE n=" + SIZE, "", "sz=" + sz);
+
+			rpt.Run(SIZE, () =>
+			{
+				StructTest stru = new StructTest();
+				int p=0,i;
+				for (i=0;i< SIZE;i++ )
 				{
 #if STRU
 					stru.Fill(i,ab);
@@ -186,18 +224,19 @@ namespace Snail.Tests.Threading
 #elif true
 					p = ab.Write(p, ref i);
 #endif
-					i++;
 				}
 				Console.WriteLine("i={0} p={1}", i, p);
 			});
 			Console.WriteLine(rpt);
+#endif
+#if READ
 			rpt = new Report("READ.SAFE", "Unsafe", "");
-			rpt.Run(COUNT, () =>
+			rpt.Run(SIZE, () =>
 			{
 				StructTest stru = new StructTest();
-				int i = 0;
 				int v = 0;
-				for (int p = 0; p < ab.Length; )
+				int p = 0;
+				for (int i=0;i<SIZE;i++)
 				{
 #if STRU
 					p = ab.Read(p, ref stru);
@@ -208,50 +247,81 @@ namespace Snail.Tests.Threading
 					if (v != i)
 						throw new InvalidOperationException();
 #endif
-					i++;
 				}
 			});
 			Console.WriteLine(rpt);
-			ab = new ArgsBuffer(MaxAddr);
-			rpt = new Report("WRITE.PTR n=" + COUNT, "", "sz=" + sz);
+#endif
+#if RW
+			rpt = new Report("READ/WRITE.SAFE", "Unsafe", "");
 			rpt.Run(COUNT, () =>
+			{
+				StructTest stru = new StructTest();
+				int v = 0;
+				int pr = 0, pw = 0;
+				for (int i = 0; i < COUNT; i++)
+				{
+#if STRU
+					stru.Fill(i, ab);
+					pw = ab.Write(pw, ref stru);
+					pr = ab.Read(pr, ref stru);
+					if (!stru.Check(i, ab))
+						throw new InvalidOperationException();
+#elif true
+					v = i;
+					pw = ab.Write(pw, ref v);
+					pr = ab.Read(pr, ref v);
+					if (v != i)
+						throw new InvalidOperationException();
+#endif
+				}
+			});
+			Console.WriteLine(rpt);
+#endif
+#endif
+#if PTR
+#if WRITE
+			rpt = new Report("WRITE.PTR n=" + SIZE, "", "sz=" + sz);
+			rpt.Run(SIZE, () =>
 			{
 				StructTest stru = new StructTest();
 				int i = 0;
 				fixed (byte* pin = &ab.GetBuffer()[0])
 				{
 					byte* p = pin;
-					for (i = 0; i < COUNT; i++)
+					byte* pe = pin + ab.Capacity;
+					for (i = 0; i < SIZE; i++)
 					{
 #if STRU
 					stru.Fill(i,ab);
-					p = ArgsBuffer.Write(p, ref stru);
+					p = ByteArrayUtils.Write(p, ref stru);
 #elif true
-						p = ArgsBuffer.Write(p, ref i);
+					p = ByteArrayUtils.Write(p, ref i);
 #endif
 					}
 				}
 				Console.WriteLine("i={0}", i);
 			});
 			Console.WriteLine(rpt);
-
-			rpt = new Report("READ.PTR n=" + COUNT, "", "sz=" + sz);
-			rpt.Run(COUNT, () =>
+#endif
+#if READ
+			rpt = new Report("READ.PTR n=" + SIZE, "", "sz=" + sz);
+			rpt.Run(SIZE, () =>
 			{
 				StructTest stru = new StructTest();
 				int i = 0;
 				fixed (byte* pin = &ab.GetBuffer()[0])
 				{
 					byte* p = pin;
+					byte* pe = pin + ab.Capacity;
 					int v = 0;
-					for (i = 0; i < COUNT; i++)
+					for (i = 0; i < SIZE; i++)
 					{
 #if STRU
-						p = ArgsBuffer.Read(p, ref stru);
+						p = ByteArrayUtils.Read(p, ref stru);
 					if (!stru.Check(i,ab))
 						throw new InvalidOperationException();
 #elif true
-						p = ArgsBuffer.Read(p, ref v);
+						p = ByteArrayUtils.Read(p, ref v);
 						if (v != i)
 							throw new InvalidOperationException();
 #endif
@@ -260,6 +330,43 @@ namespace Snail.Tests.Threading
 				Console.WriteLine("i={0}", i);
 			});
 			Console.WriteLine(rpt);
+#endif
+#if RW
+			rpt = new Report("READ/WRITE.PTR n=" + COUNT, "", "sz=" + sz);
+			rpt.Run(COUNT, () =>
+			{
+				StructTest stru = new StructTest();
+				int i = 0;
+				fixed (byte* pin = &ab.GetBuffer()[0])
+				{
+					byte* p = pin;
+					byte* pr = pin;
+					byte* pe = pin + ab.Capacity;
+					int v;
+					for (i = 0; i < COUNT; i++)
+					{
+#if STRU
+						stru.Fill(i, ab);
+						p = ByteArrayUtils.Write(p,  ref stru);
+						pr = ByteArrayUtils.Read(pr,  ref stru);
+						if (!stru.Check(i, ab))
+							throw new InvalidOperationException();
+#elif true
+						v = i;
+						p = ByteArrayUtils.Write(p, ref v);
+						pr = ByteArrayUtils.Read(pr, ref v);
+						if (v != i)
+							throw new InvalidOperationException();
+#endif
+						if (p >= pe) p = pin;
+						if (pr >= pe) pr = pin;
+					}
+				}
+				Console.WriteLine("i={0}", i);
+			});
+			Console.WriteLine(rpt);
+#endif
+#endif
 		}
 	}
 }

@@ -4,10 +4,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Disruptor;
 using Disruptor.Dsl;
-using Snail.Threading.Disruptor;
-using Snail.Util;
 
-namespace Snail.Threading.Disruptor
+namespace Disruptor
 {
 	public class MultiEventHandlerGroup<T> where T : class
 	{

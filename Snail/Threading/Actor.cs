@@ -6,7 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Disruptor;
 
-namespace Snail.Threading
+namespace Snail.Threading.A1
 {
 
 	public interface IMessage
@@ -178,7 +178,6 @@ namespace Snail.Threading
 	{
 		private bool _autonomous = false;
 		private Mailbox _controller;
-		private bool _hasData;
 		private TaskScheduler _taskScheduler = TaskScheduler.Default;
 		internal INonBlockingQueue<IMessage> _queue;
 		private const int MaxBatch = int.MaxValue;

@@ -1,7 +1,7 @@
 using Disruptor;
 using Disruptor.Dsl;
 
-namespace SlothDB
+namespace Disruptor
 {
 	public class NoDisruptor<T>:IDisruptor<T>
 	{

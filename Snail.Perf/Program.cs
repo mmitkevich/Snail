@@ -6,10 +6,10 @@ namespace Snail.Tests
 	{
 		private static void Main(string[] args)
 		{
-			//BQueueTest.Run();
-			ArgsBufferTests.test();
+			BQueueTest.Run();
+			//ArgsBufferTests.test();
 			//WorkerPoolTests.Run();
-			//ActorTest.Run();
+			ActorTest.Run();
 		}
 	}
 }

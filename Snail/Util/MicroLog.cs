@@ -5,8 +5,9 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Disruptor.Scheduler;
 
-namespace SlothDB.Threading
+namespace Snail.Util
 {
 	/// <summary>
 	/// Micro log class for cases when speed of logging is more important than other stuff.
@@ -30,6 +31,7 @@ namespace SlothDB.Threading
 		internal object[] Args;
 		internal int Level;
 		internal Exception Exception;
+		internal int ProcessorId;
 
 		private const int SIZE = 1024;
 		private static MicroLog[] _entries = new MicroLog[SIZE];
@@ -40,13 +42,20 @@ namespace SlothDB.Threading
 		public static int MinLevel;
 		public static int ThrowLevel = (int)LogLevel.Error;
 
-		public static bool OverrideWhenFull = false;
+		public enum WhenFullAction
+		{
+			Overwrite,
+			Dump,
+			NoCaching
+		}
+
+		public static WhenFullAction WhenFull = WhenFullAction.NoCaching;
 
 		/// <summary>
 		/// Number of errors.
 		/// </summary>
 		public static int ErrCount;
-		public static TextWriter Writer = Console.Out;
+		public static List<TextWriter> Writers = new List<TextWriter>(new[] { Console.Out });
 		private static Volatile.Integer IsConsuming = new Volatile.Integer(0);
 		private static SpinWait wait=new SpinWait() ;
 
@@ -88,16 +97,16 @@ namespace SlothDB.Threading
 
 		internal static void Log(int level, string format, Exception e, params object[] args)
 		{
-			if (level < MinLevel || Writer==null)
+			if (level < MinLevel || Writers.Count==0)
 				return;
 
 			int seq = _logIndex.AtomicIncrementAndGet();
-			if (OverrideWhenFull)
+			if (WhenFull==WhenFullAction.Overwrite)
 			{
 				if(seq-_dumpIndex.ReadFullFence()>=SIZE)
 					_dumpIndex.WriteFullFence(seq-SIZE+1);
 			}
-			else
+			else 
 			{
 				while (seq - _dumpIndex.ReadFullFence() >= SIZE)
 				{
@@ -112,10 +121,21 @@ namespace SlothDB.Threading
 			_entries[i].Args = args;
 			_entries[i].Exception = e;
 			_entries[i].ThreadId = Thread.CurrentThread.ManagedThreadId;
+			_entries[i].ProcessorId = RoundRobinThreadAffinedTaskScheduler.CurrentThreadProcessorIndex;
+
+			while(_publishIndex.ReadFullFence()!=seq-1)
+				wait.SpinOnce();
+		
 			_publishIndex.WriteFullFence(seq);
 
 			if (level >= (int)LogLevel.Error)
 				ErrCount++;
+
+			if(WhenFull==WhenFullAction.NoCaching)
+			{
+				Dump();
+				Flush();
+			}
 
 			if(level>=ThrowLevel)
 				throw new InvalidOperationException(_entries[i].ToString(),e);
@@ -124,7 +144,7 @@ namespace SlothDB.Threading
 		public override string ToString()
 		{
 			string r =
-				string.Format("{2}{0:HH:mm:ss.fffffff} {1,4}| ", Time, ThreadId, Level >= (int) LogLevel.Error ? "E" : " ") +
+				string.Format("{2}{0:HH:mm:ss.fffffff}|{1,2}/{3,2}| ", Time, ThreadId, Level >= (int) LogLevel.Error ? "E" : " ",ProcessorId) +
 				string.Format(Format, Args);
 			if(Exception!=null)
 				r = r + "|" + Exception.Message+"|"+Exception.StackTrace;
@@ -135,19 +155,25 @@ namespace SlothDB.Threading
 		{
 			sw.WriteLine(ToString());
 		}
-
+		public static void Flush()
+		{
+			Writers.ForEach(w=>w.Flush());
+		}
 		public static void Dump()
 		{
-			if (IsConsuming.AtomicCompareExchange(1,0))
+			while (_dumpIndex.ReadFullFence() <= _publishIndex.ReadFullFence())
 			{
-				while (_dumpIndex.ReadCompilerOnlyFence() <= _publishIndex.ReadFullFence())
+				if (IsConsuming.AtomicCompareExchange(1, 0))
 				{
-					int i = _dumpIndex.ReadCompilerOnlyFence() & (SIZE - 1);
-					if(Writer!=null)
-						_entries[i].Print(Writer);
-					_dumpIndex.WriteCompilerOnlyFence(_dumpIndex.ReadCompilerOnlyFence() + 1);
+					if (_dumpIndex.ReadFullFence() <= _publishIndex.ReadFullFence())
+					{
+						int i = _dumpIndex.ReadFullFence() & (SIZE - 1);
+						foreach (var wr in Writers)
+							_entries[i].Print(wr);
+						_dumpIndex.WriteCompilerOnlyFence(_dumpIndex.ReadCompilerOnlyFence() + 1);
+					}
+					IsConsuming.WriteFullFence(0);
 				}
-				IsConsuming.WriteFullFence(0);
 			}
 		}
 
@@ -160,7 +186,7 @@ namespace SlothDB.Threading
 			while (true)
 			{
 				Dump();
-				Thread.Sleep(0);
+				Thread.Sleep(10);
 			}
 		}
 	}

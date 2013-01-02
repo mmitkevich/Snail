@@ -1,11 +1,7 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading;
-using Disruptor;
 
-namespace Snail.Threading.Disruptor
+namespace Disruptor
 {
 	public class LeastLoadResourceStrategy<T> : ResourceStrategy<T>
 	{

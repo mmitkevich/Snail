@@ -34,7 +34,6 @@ namespace Snail.Util
 				// compile it
 				Subtract = Expression.Lambda<Func<T, T, T>>(body, paramA, paramB).Compile();
 			}
-
 			{
 				SizeOf = Marshal.SizeOf (typeof(T));
 			}
@@ -56,4 +55,5 @@ namespace Snail.Util
 			}
 		}
 	}
+
 }

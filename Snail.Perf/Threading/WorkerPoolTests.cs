@@ -10,9 +10,8 @@ using System.Threading.Tasks;
 using Disruptor;
 using Disruptor.Dsl;
 using Disruptor.Scheduler;
-using SlothDB;
-using SlothDB.Threading;
-using Snail.Threading.Disruptor;
+using Snail.Threading;
+using Snail.Util;
 
 namespace Snail.Tests.Threading
 {
@@ -345,8 +344,7 @@ namespace Snail.Tests.Threading
 		{
 			ConfigureStrategies();
 			
-			MicroLog.Writer = Console.Out;
-			MicroLog.OverrideWhenFull = true;
+			MicroLog.WhenFull = MicroLog.WhenFullAction.Overwrite;
 
 			//RunCycles();
 
