@@ -1,6 +1,7 @@
-﻿//#define CHUNKED
+﻿#define CHUNKED
 #define MESSAGETEST
 //#define MYMSG
+#define ARGSBUF
 
 using System;
 using System.Collections.Generic;
@@ -9,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Snail.Threading;
+using Snail.Util;
 
 namespace Snail.Tests.Threading
 {
@@ -78,7 +80,7 @@ namespace Snail.Tests.Threading
 
 		}
 #endif
-		public static void Run()
+		public static unsafe void Run()
 		{
 			var queueSize = 8*1024*1024;
 			Console.WriteLine("Allocating "+queueSize);
@@ -88,9 +90,11 @@ namespace Snail.Tests.Threading
 				new BQueue<TMessage, TMessageElement>(queueSize);
 #else
 				new MessageQueue(new Mailbox(MailboxScheduler.Current));//, queueSize);
+			var qm = q.Messages;
 #endif
 #else
-				new BQueue<long,BQueueElement<long>>(queueSize,true);
+				new BQueue<long,BQueueElement<long>>(queueSize);
+						var qm = q;
 #endif
 			int Count =
 #if DEBUG
@@ -98,6 +102,7 @@ namespace Snail.Tests.Threading
 #else
 				32 * 1024 * 1024;
 #endif
+			qm.Pin();
 			Console.WriteLine("Starting " + Count);
 			Fake = Fake1;
 			ManualResetEvent done = new ManualResetEvent(false);
@@ -109,15 +114,22 @@ namespace Snail.Tests.Threading
 					var t = Task.Factory.StartNew(() =>
 					{
 						int v = 0;
-						int seq; 
+						int seq;
+
+						void* pmsg = qm.BufferPtr;
+
 						for (int i = 0; i < Count; i++)
 						{
 #if MESSAGETEST
-							q.WaitForData();
-							int idx = q.ToIndex(q.Tail);
-							var b = q.Buffer;
+							qm.WaitForData();
+							int idx = qm.SeqToIdx(qm.Tail);
+							var b = qm.Buffer;
+#if ARGSBUF							
+							v=q.Args.Read<int>();
+#else
 							v = (int) b[idx].WP1;
-							q.FreeTail();
+#endif
+							qm.FreeTail();
 #else
 							v = (int) q.Dequeue();
 #endif
@@ -135,28 +147,34 @@ namespace Snail.Tests.Threading
 						{
 							ve++;					
 #if MESSAGETEST							
-							q.WaitForFreeSlots();
-							int idx = q.ToIndex(q.Head);
+							if(qm.Tail==qm.BatchTail)
+								qm.RealWaitForFreeSlots();
+
+							int idx = (int)(qm.Head & qm.Mask);
+#if !ARGSBUF							
 							q.Buffer[idx].WP1 = ve;
+#else
+							q.Args.Write(ve);
+#endif
 #if MYMSG
 							q.Buffer[idx].Empty = TMessage._NotEmpty;
 #else
-							q.Buffer[idx].Executor = Fake;
+							qm.Buffer[idx].Executor = Fake;
 #endif
-							q.NextHead();
+							qm.Head = qm.NextSeq(qm.Head);
 #else
 							q.Enqueue(ve);
 #endif
-	
+
 						}
-						Console.WriteLine("QS {0:F2}",(double)q.Count/q.Capacity);
+						Console.WriteLine("QS {0:F2}", (double)q.Messages.Count / q.Messages.Capacity);
 					}
 					Console.WriteLine("ENQ DONE");
 					t.Wait();
 				});
 				Console.WriteLine(rep);
-				Console.WriteLine("Backtracks {0} {1:F4}% EnqFulls {2} {3:F4}", q.Backtrackings,
-								  (double)100 * q.Backtrackings / Count, q.EnqueueFulls, (double)100 * q.EnqueueFulls/ Count);
+				Console.WriteLine("Backtracks {0} {1:F4}% EnqFulls {2} {3:F4}", q.Messages.Backtrackings,
+								  (double)100 * q.Messages.Backtrackings / Count, q.Messages.EnqueueFulls, (double)100 * q.Messages.EnqueueFulls / Count);
 			}
 		}
 	}

@@ -14,7 +14,7 @@
 		int BitLength { get; }
 
 		/// <summary>
-		/// Next block in chain
+		/// NextSeq block in chain
 		/// </summary>
 		ICompressedBlock Inner { get; }
 	}

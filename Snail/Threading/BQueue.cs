@@ -1,9 +1,7 @@
-﻿#define BACKTRACKING
-#define ADAPTIVE
-#define ADAPT_ALWAYS
+﻿#define ADAPTIVE
 #define POWER2BUFFER
 #define STATS
-#define INLINE_EMPTY_ELEMENT
+
 
 /*
 * B-Queue -- An efficient and practical queueing for fast core-to-core
@@ -31,24 +29,14 @@
 
 namespace Snail.Threading
 {
-	using System.Threading;
 	using System;
+	using System.Threading;
 	using System.Collections;
 	using System.Collections.Concurrent;
 	using System.Collections.Generic;
+	using System.Runtime.InteropServices;
 	using Snail.Util;
-
-	public interface ITranslator<T>
-	{
-		void Translate(int index, ref T value);
-	}
-
-	public delegate void RefAction<T1>(ref T1 t1);
-	public delegate void OutAction<T1>(out T1 t1);
-
-	public delegate T2 RefFunc<T1,T2>(ref T1 t1);
-
-	public delegate void RefAction<in T1, T2>(T1 t1, ref T2 t2);
+	
 	
 	public interface IBQueueElement<T>
 	{
@@ -59,7 +47,8 @@ namespace Snail.Threading
 
 	public struct BQueueElement<T>:IBQueueElement<T>
 	{
-		private T _emptyElement;
+		private readonly T _emptyElement;
+
 		public BQueueElement(T emptyElement)
 		{
 			_emptyElement = emptyElement;
@@ -83,7 +72,7 @@ namespace Snail.Threading
 				ret
 #endif
 			}
-			return true;
+			return !object.Equals(val,_emptyElement);
 		}
 
 		public void SetEmptyElement(ref T val)
@@ -92,138 +81,203 @@ namespace Snail.Threading
 		}
 	}
 
-	public class BQueue<T, THelper> : IProducerConsumerCollection<T> where THelper:IBQueueElement<T>,new()
+	
+
+	public sealed unsafe class BQueue<T, THelper> : IProducerConsumerCollection<T> where THelper:IBQueueElement<T>  
 	{
-		public const int QUEUE_SIZE = 64*1024;
+		public const int DefaultCapacity = 64*1024;
 
-		private int CONS_BATCH_SIZE;
-		private int PROD_BATCH_SIZE;
-		private int BATCH_INCREMENT;
+		public const int NoWait = 0;
+		public const int BlockWait = -1;
 
-		private int _size;
+		private int _consumerBatchSize;
+		private int _producerBatchSize;
+		private int _batchIncrement;
+
+		private int _capacity;
 		private int _mask;
+		private T[] _buffer;
+
+		private int _batch_history;
+
+		private SpinWait _wt = new SpinWait();
+		public THelper Helper = default(THelper);
+
+		public void* BufferPtr
+		{
+			get { return _x.BufferPtr; }
+		}
+
+		[StructLayout(LayoutKind.Sequential, Pack=8)]
+		private unsafe struct QueueData
+		{
+			public long Head;
+			public long BatchHead;
+			public void* BufferPtr;
+
+#if STATS			
+			public long EnqueueFulls;
+#endif
+			private fixed long _pad2 [8];
+			public long Tail;
+			public long BatchTail;
+#if STATS
+			public long _backtrackings;
+#endif
+		}
+
+		private GCHandle _gch;
+		private QueueData _x = default(QueueData);
+
+		
+		public long EnqueueFulls
+		{
+			get
+			{
+	#if STATS
+				return _x.EnqueueFulls;
+	#endif
+			}
+		}
+
+		public long Backtrackings
+		{
+			get
+			{
+	#if STATS
+				return _x._backtrackings;
+	#endif
+			}
+		}
 
 		public int Mask
 		{
 			get { return _mask; }
 		}
-		
-		private T[] _data;
-		private int _batch_history;
-
-	//#if STATS
-		private Volatile.PaddedInteger _enqueueFulls = new Volatile.PaddedInteger(0);
-		private Volatile.PaddedInteger _backtrackings = new Volatile.PaddedInteger(0); 
-		public int EnqueueFulls
-		{
-			get { return _enqueueFulls.ReadUnfenced(); }
-		}
-
-		public int Backtrackings
-		{
-			get { return _backtrackings.ReadUnfenced(); }
-		}
-	//#endif
-
-		public const int NO_WAIT = 0;
-		public const int BLOCK_WAIT = -1;
-
-		private Volatile.PaddedInteger _head;
-		private Volatile.PaddedInteger _batch_head;
-
-		private Volatile.PaddedInteger _tail;
-		private Volatile.PaddedInteger _batch_tail;
-
-		protected T _emptyElement = default(T);
-		private SpinWait _wt = new SpinWait();
-
-		public THelper Helper = default(THelper);
-
-#if !INLINE_EMPTY_ELEMENT
-		public RefFunc<T,bool> IsNotEmptyElement;
-		public RefAction<T> SetEmptyElement;
-#endif
-		public BQueue() : this(QUEUE_SIZE,default(T),false){}
-		public BQueue(int size, bool fastCompare=false) : this(size, default(T),fastCompare) { }
 
 		public int Capacity
 		{
-			get { return _size; }
+			get { return _capacity; }
 		}
 
 		public T[] Buffer
 		{
-			get { return _data; }
+			get { return _buffer; }
 		}
 
-		public BQueue(int size, T emptyElement, bool fastCompare)
+		public BQueue() : this(DefaultCapacity)
 		{
-			_size = size;
-			_emptyElement = emptyElement;
-
-#if !INLINE_EMPTY_ELEMENT
-			IsNotEmptyElement = IsNotEmptyElementDefault;
-			SetEmptyElement = SetEmptyElementDefault;
-			if (fastCompare)
-			{
-				IsNotEmptyElement = IsNotEmptyElementFastImpl;
-			}
-#endif
+		}
+		
+		public BQueue(int capacity)
+		{
+			_capacity = capacity;
 
 #if POWER2BUFFER
-			//if(size^(size+1))
-			_mask = size - 1;
-		#endif
-			CONS_BATCH_SIZE = PROD_BATCH_SIZE = _size/16;
-			BATCH_INCREMENT = _size/32;
+			//if(capacity^(capacity+1))
+			_mask = capacity - 1;
+#endif
+			_consumerBatchSize = _producerBatchSize = _capacity/16;
+			_batchIncrement = _capacity/32;
 
-			_data = new T[_size];
-			for (int i = 0; i < _data.Length; i++)
-				Helper.InitElement(ref _data[i]);
+			_buffer = new T[_capacity];
 
-			_batch_history = CONS_BATCH_SIZE;
+			for (int i = 0; i < _buffer.Length; i++)
+				Helper.InitElement(ref _buffer[i]);
+
+			_batch_history = _consumerBatchSize;
 		}
 
-		private void wait_ticks()
+		public void Pin()
+		{
+			if (!_gch.IsAllocated)
+				_gch = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
+			_x.BufferPtr = (void*)_gch.AddrOfPinnedObject();
+		}
+
+		public void Unpin()
+		{
+			if(_gch.IsAllocated)
+				_gch.Free();
+			_x.BufferPtr = null;
+		}
+
+		private void WaitTicks()
 		{
 			//if(!_wt.NextSpinWillYield)
 				_wt.SpinOnce();
 		}
 
-		public int Head
+		public long Head
 		{
-			get { return _head.ReadUnfenced(); }
-			set { _head.WriteUnfenced(value);}
+			get { return _x.Head; }
+			set { _x.Head = ToSeq(value); }
 		}
 
-		public int ToIndex(int seq)
+		public long BatchHead
+		{
+			get { return _x.BatchHead; }
+		}
+
+		public int SeqToIdx(long seq)
 		{
 #if POWER2BUFFER
-			return seq & _mask;
+			return (int)(seq & _mask);
 #else
-			return head;
+			return (int) seq;
 #endif
 		}
 		
-		public int NextHead()
+		public long NextHead()
 		{
-			int head = _head.ReadUnfenced();
-			head++;
-#if !POWER2BUFFER
-			if(head>=_size)
-				head=0;
-#endif
-			_head.WriteUnfenced(head);
+			var head = NextSeq(_x.Head);
+			_x.Head = head;
 			return head;
 		}
 	
-		public int Tail
+		public long Tail
 		{
-			get { return _tail.ReadUnfenced(); }
-			set { _tail.WriteUnfenced(value);}
+			get { return _x.Tail; }
+			set
+			{
+				_x.Tail = ToSeq(value);
+			}
 		}
 
-		public int Next(int idx)
+		public long BatchTail
+		{
+			get { return _x.BatchTail; }
+		}
+
+		private long ToSeq(long arg)
+		{
+#if !POWER2BUFFER
+			var sz = _size;
+			while(arg>sz)
+				arg-=sz;
+#endif
+			return arg;
+		}
+
+		public int Available
+		{
+			get { return (int)(_x.BatchTail - _x.Tail); }
+		}
+
+		public int Count
+		{
+			get
+			{
+				int count = (int)(_x.Head - _x.Tail);
+#if !POWER2BUFFER				
+				if(count<0)
+					count += _size;
+#endif
+				return count;
+			}
+		}
+
+		public long NextSeq(long idx)
 		{
 #if POWER2BUFFER
 			return idx + 1;
@@ -232,236 +286,158 @@ namespace Snail.Threading
 #endif
 		}
 
-		public int FreeTail()
+		public void FreeTail()
 		{
-			int tail = _tail.ReadUnfenced();
-			int idx;
-#if POWER2BUFFER
-			idx = tail & _mask;
-#else
-			idx = tail;
-#endif
-			Helper.SetEmptyElement(ref _data[idx]);
-			tail++;
-#if !POWER2BUFFER
-			if(tail>=_size)
-				tail=0;
-#endif
-			_tail.WriteUnfenced(tail);
-			return tail;
+			var tail = _x.Tail;
+			var idx = SeqToIdx(tail);
+			Helper.SetEmptyElement(ref _buffer[idx]);
+			tail = NextSeq(tail);
+			_x.Tail = tail;
 		}
 
-		public void SetTail(int tail)
+		public int WaitForFreeSlots(int batchSize = 1 , int ticksWait = BlockWait )
 		{
-			_tail.WriteUnfenced(tail);
-		}
+			//var head = _x.Head;
 
-#if INLINE_EMPTY_ELEMENT
-		private bool IsNotEmptyElement(ref T val)
-		{
-			return Helper.IsNonEmptyElement(ref val);
-		}
-#endif
-
-		private bool IsNotEmptyElementDefault(ref T val)
-		{
-			return !object.Equals(val, _emptyElement);
-		}
-#if INLINE_EMPTY_ELEMENT
-		private void SetEmptyElement(ref T val)
-		{
-			Helper.SetEmptyElement(ref val);
-		}
-#endif
-		private void SetEmptyElementDefault(ref T val)
-		{
-			val = _emptyElement;
-		}
-
-		public int WaitForFreeSlots(int batchSize = 1, int ticksWait = BLOCK_WAIT)
-		{
-			var head = _head.ReadUnfenced();
-
-			var batch_head = _batch_head.ReadUnfenced();
-			var size = batch_head - head;
+			//var batch_head = _x.BatchHead;
+			var size = Available;//(int)(batch_head - head);
 #if !POWER2BUFFER	
 			if (size < 0)
 				size += _size;
 #endif
-			if (size >= batchSize)
-				return size;
-
-			return RealWaitForFreeSlots(batchSize, ticksWait);
+			if (size < batchSize)
+				RealWaitForFreeSlots(batchSize, ticksWait); 
+			
+			return size;
 		}
 
-		public int BatchHead
-		{
-			get { return _batch_head.ReadUnfenced(); }
-		}
 
-		public int RealWaitForFreeSlots(int batchSize = 1, int ticksWait = BLOCK_WAIT)
-		{
-			var head = _head.ReadUnfenced();
-			var batch_head = _batch_head.ReadUnfenced();
 
-			if (batchSize < PROD_BATCH_SIZE)
-				batchSize = PROD_BATCH_SIZE;
+		public int RealWaitForFreeSlots(int batchSize = 1, int ticksWait = BlockWait)
+		{
+			var head = _x.Head;
+			var batch_head = _x.BatchHead;
+
+			if (batchSize < _producerBatchSize)
+				batchSize = _producerBatchSize;
 			batch_head = head + batchSize;
-#if POWER2BUFFER
-			var idx = batch_head & _mask;
-#else
-				if (batch_head >= _size)
-					batch_head = 0;
-				var idx = batch_head;
-#endif
-			if (IsNotEmptyElement(ref _data[idx]))
+			var idx = SeqToIdx(batch_head);
+			if (Helper.IsNonEmptyElement(ref _buffer[idx]))
 			{
 #if STATS
-				_enqueueFulls.WriteUnfenced(_enqueueFulls.ReadUnfenced()+1);
+				_x.EnqueueFulls++;
 #endif
-				if (ticksWait != NO_WAIT)
+				if (ticksWait != NoWait)
 				{
 					long start = DateTime.UtcNow.Ticks;
 					do
 					{
-						wait_ticks();
+						WaitTicks();
 						if (ticksWait > 0 && (int)(DateTime.UtcNow.Ticks - start) > ticksWait)
 						{
 							return 0;
 						}
-					} while (IsNotEmptyElement(ref _data[idx]));
+					} while (Helper.IsNonEmptyElement(ref _buffer[idx]));
 				}
 			}
-			_batch_head.WriteUnfenced(batch_head);
-			return batch_head - head;
+			_x.BatchHead = batch_head;
+			return (int)(batch_head - head);
 		}
 
 		public void Enqueue(T value)
 		{
-			var head = _head.ReadUnfenced();
-			var batch_head = _batch_head.ReadUnfenced();
+			var head = _x.Head;
+			var batch_head = _x.BatchHead;
 			
 			if (head == batch_head)
-				WaitForFreeSlots();
+				RealWaitForFreeSlots();
 
-			_data[ToIndex(head)] = value;
-			NextHead();
+			_buffer[SeqToIdx(head)] = value;
+			
+			head = NextSeq(head);
+			_x.Head = head;
 		}
 
-		public void Enqueue(RefAction<int, T> translator)
+		public void Enqueue(RefAction<long, T> translator)
 		{
-			var head = _head.ReadUnfenced();
-			var batch_head = _batch_head.ReadUnfenced();
+			var head = _x.Head;
+			var batch_head = _x.BatchHead;
 
 			if (head == batch_head)
-				WaitForFreeSlots();
+				RealWaitForFreeSlots();
 
-			translator(head, ref _data[ToIndex(head)]);
-			NextHead();
-		}
-
-		public void Commit(int head)
-		{
-			_head.WriteUnfenced(head);
+			translator(head, ref _buffer[SeqToIdx(head)]);
+			head = NextSeq(head);
+			_x.Head = head;
 		}
 
 		private int Backtracking()
 		{
 		#if STATS			
-			_backtrackings.WriteUnfenced(_backtrackings.ReadUnfenced()+1);
+			_x._backtrackings++;
 		#endif
-			var tail = _tail.ReadUnfenced();
-			var tmp_tail = tail;
+
+			var tail = _x.Tail;
+			var batch_tail = tail;
 			
-		#if BACKTRACKING			
-			tmp_tail += _batch_history; 
-			//tmp_tail += CONS_BATCH_SIZE;
-		#endif
-		#if !POWER2BUFFER
-			if ( tmp_tail >= _size ) 
-				tmp_tail = 0;
-		#endif
+			batch_tail += _batch_history; 
+			//tmp_tail += _consumerBatchSize;
+	
 		#if ADAPTIVE
-			if (_batch_history < CONS_BATCH_SIZE)
+			if (_batch_history < _consumerBatchSize)
 			{
 				_batch_history =
-					(CONS_BATCH_SIZE < (_batch_history + BATCH_INCREMENT)) ?
-					CONS_BATCH_SIZE : (_batch_history + BATCH_INCREMENT);
+					(_consumerBatchSize < (_batch_history + _batchIncrement)) ?
+					_consumerBatchSize : (_batch_history + _batchIncrement);
 			}
 		#endif
 
-		#if BACKTRACKING
-			var batch_size = _batch_history;
-		  #if POWER2BUFFER
-			var idx = ((int)tmp_tail) & _mask;
-			while ( !IsNotEmptyElement(ref _data[idx]) ) 
-		  #else
-			while ( !IsNotEmptyElement(ref _data[tmp_tail]) )
-		  #endif
+			var batchSize = _batch_history;
+			var idx = SeqToIdx(batch_tail);
+
+			while ( !Helper.IsNonEmptyElement(ref _buffer[idx]) ) 
 			{
-				if (batch_size == 0)
+				if (batchSize == 0)
 					return 0;
 				
-				//wait_ticks();
+				//WaitTicks();
 
-				batch_size = batch_size >> 1;
-				tmp_tail = tail + batch_size;
-			#if POWER2BUFFER
-				idx = ((int)tmp_tail) & _mask;
-			#else
-				if (tmp_tail >= _size)
-					tmp_tail = 0;	
-			#endif
+				batchSize = batchSize >> 1;
+				batch_tail = tail + batchSize;
+				idx = SeqToIdx(batch_tail);
 			}
-			#if ADAPTIVE
-			_batch_history = batch_size;
-			#endif
-		#else
-			if ( !IsNotEmptyElementFast(_data[tmp_tail])  )
-			{
-				return false;
-			}
+		#if ADAPTIVE
+			_batch_history = batchSize;
 		#endif
-			if ( tmp_tail == tail ) 
+		
+			if ( batch_tail == tail )
 			{
-			#if POWER2BUFFER
-				tmp_tail++;
-			#else
-				tmp_tail = (tmp_tail + 1) >= _size ?
-					0 : tmp_tail + 1;
-			#endif
+				batch_tail = NextSeq(batch_tail);
 			}
-			_batch_tail.WriteUnfenced( tmp_tail );
-			return tmp_tail-tail;
+			_x.BatchTail = batch_tail;
+			return (int)(batch_tail-tail);
 		}
 	
 
-		public int WaitForData(int ticksWait = BLOCK_WAIT)
+		public int WaitForData(int ticksWait = BlockWait)
 		{
-			var tail = _tail.ReadUnfenced();
-			var batch_tail = _batch_tail.ReadUnfenced();
-			var ready=batch_tail-tail;
+			var tail = _x.Tail;
+			var batch_tail = _x.BatchTail;
+			var ready = (int)(batch_tail-tail);
 			if (ready == 0)
 				ready = RealWaitForData(ticksWait);
 			return ready;
 		}
 
-		public int Available
-		{
-			get { return _batch_tail.ReadUnfenced() - _tail.ReadUnfenced(); }
-		}
-
 		public int RealWaitForData(int ticksWait)
 		{
-			var tail = _tail.ReadUnfenced();
-			var batch_tail = _batch_tail.ReadUnfenced();
 			int ready;
-			if ((ready = Backtracking()) == 0 && ticksWait != NO_WAIT)
+			if ((ready = Backtracking()) == 0 && ticksWait != NoWait)
 			{
 				long start = DateTime.UtcNow.Ticks;
 				do
 				{
-					wait_ticks();
+					WaitTicks();
 					if (ticksWait > 0 && (int)(DateTime.UtcNow.Ticks - start) > ticksWait)
 					{
 						return 0;
@@ -471,13 +447,11 @@ namespace Snail.Threading
 			return ready;
 		}
 
-		public bool TryDequeue(out T value, int ticksWait = NO_WAIT)
+		public bool TryDequeue(out T value, int ticksWait = NoWait)
 		{
-			int seq;
 			if (WaitForData(ticksWait) == 0)
 			{
-				value = _emptyElement;
-//				SetEmptyElement(ref value);
+				value = default(T);
 				return false;
 			}
 
@@ -486,7 +460,7 @@ namespace Snail.Threading
 			return true; //SUCCESS
 		}
 	
-		public bool TryEnqueue(T value, int ticksWait = NO_WAIT)
+		public bool TryEnqueue(T value, int ticksWait = NoWait)
 		{
 			if(0==WaitForFreeSlots(1, ticksWait))
 				return false;
@@ -495,7 +469,7 @@ namespace Snail.Threading
 			return true;
 		}
 
-		public bool TryEnqueue(RefAction<int, T> translator, int ticksWait = NO_WAIT)
+		public bool TryEnqueue(RefAction<long, T> translator, int ticksWait = NoWait)
 		{
 			if (0 == WaitForFreeSlots(1, ticksWait))
 				return false;
@@ -506,38 +480,29 @@ namespace Snail.Threading
 
 		public T Dequeue()
 		{
-			T value;
-			
-			var tail = _tail.ReadUnfenced();
-			var batch_tail = _batch_tail.ReadUnfenced();
+			var tail = _x.Tail;
+			var batch_tail = _x.BatchTail;
 			
 			if(tail==batch_tail)
 				WaitForData();
 
-#if POWER2BUFFER
-			int idx = tail & _mask;
-#else
-			int idx = _tail.ReadUnfenced();
-#endif
-			value = _data[idx];
-			SetEmptyElement(ref _data[idx]);
-			tail++;
-#if !POWER2BUFFER
-			if(tail>=_size)
-				tail=0;
-#endif
-			_tail.WriteUnfenced(tail);
+			var idx = SeqToIdx(tail);
+			T value = _buffer[idx];
+
+			Helper.SetEmptyElement(ref _buffer[idx]);
+			tail = NextSeq(tail);
+			_x.Tail = tail;
 			return value;
 		}
 
-	
+	/*
 		public void Enqueue1(T value)
 		{
-			var head = _head.ReadUnfenced();
-			var batch_head = _batch_head.ReadUnfenced();
+			var head = Head.ReadUnfenced();
+			var batch_head = BatchHead.ReadUnfenced();
 			if (head == batch_head)
 			{
-				batch_head = head + PROD_BATCH_SIZE;
+				batch_head = head + _producerBatchSize;
 #if POWER2BUFFER
 				var idx = batch_head & _mask;
 
@@ -547,18 +512,18 @@ namespace Snail.Threading
 				var idx = batch_head;
 #endif
 #if STATS				
-				if (IsNotEmptyElement(ref _data[idx]))
-					_enqueueFulls.WriteUnfenced(_enqueueFulls.ReadUnfenced()+1);
+				if (IsNotEmptyElement(ref _buffer[idx]))
+					EnqueueFulls.WriteUnfenced(EnqueueFulls.ReadUnfenced()+1);
 #endif
-				while (IsNotEmptyElement(ref _data[idx]))
-					wait_ticks();
+				while (IsNotEmptyElement(ref _buffer[idx]))
+					WaitTicks();
 
-				//SpinWait.SpinUntil(()=>_data[batch_head]!=0);
+				//SpinWait.SpinUntil(()=>_buffer[batch_head]!=0);
 					
-				_batch_head.WriteUnfenced(batch_head);
+				BatchHead.WriteUnfenced(batch_head);
 			}
 #if POWER2BUFFER
-			_data[head&_mask] = value;
+			_buffer[head&_mask] = value;
 			head++;
 #else
 			_data[head] = value;
@@ -566,22 +531,22 @@ namespace Snail.Threading
 			if (head >= _size)
 				head = 0;
 #endif
-			_head.WriteUnfenced(head);
+			Head.WriteUnfenced(head);
 		}
 
 		public T Dequeue1()
 		{
-			var tail = _tail.ReadUnfenced();
-			var batch_tail = _batch_tail.ReadUnfenced();
+			var tail = Tail.ReadUnfenced();
+			var batch_tail = BatchTail.ReadUnfenced();
 			if (tail == batch_tail)
 			{
 				while (0==Backtracking())
-					wait_ticks();
+					WaitTicks();
 			}
 #if POWER2BUFFER
 			var idx = (int) tail & _mask;
-			var value = _data[idx];
-			SetEmptyElement(ref _data[idx]);
+			var value = _buffer[idx];
+			SetEmptyElement(ref _buffer[idx]);
 			tail++;
 #else
 			var value = _data[tail];
@@ -590,29 +555,20 @@ namespace Snail.Threading
 			if (tail >= _size)
 				tail = 0;
 #endif
-			_tail.WriteUnfenced(tail);
+			Tail.WriteUnfenced(tail);
 			return value;
 		}
+		*/
 
 		private List<T> ToList()
 		{
 			var list = new List<T>();
-			int tail = _tail.ReadUnfenced();
-			int head = _head.ReadUnfenced();
+			var tail = _x.Tail;
+			var head = _x.Head;
 			while(tail!=head)
 			{
-	#if POWER2BUFFER
-				var idx = (int) tail & _mask;
-				var value = _data[idx];
-				list.Add(value);
-				tail++;
-	#else
-				var value = _data[tail];
-				list.Add(value);
-				tail++;
-				if (tail >= _size)
-					tail = 0;
-	#endif
+				list.Add(_buffer[SeqToIdx(tail)]);
+				tail = NextSeq(tail);
 			}
 			return list;
 		}
@@ -630,19 +586,6 @@ namespace Snail.Threading
 		void ICollection.CopyTo(Array array, int index)
 		{
 			ToList().CopyTo((T[])array,index);
-		}
-
-		public int Count
-		{
-			get
-			{
-				int count = _head.ReadUnfenced() - _tail.ReadUnfenced();
-#if !POWER2BUFFER				
-				if(count<0)
-					count += _size;
-#endif
-				return count;
-			}
 		}
 
 		object ICollection.SyncRoot

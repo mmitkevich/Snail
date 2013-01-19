@@ -1,4 +1,4 @@
-﻿//#define CHUNKED
+﻿#define CHUNKED
 //#define CHUNK_DYN
 using System;
 using System.Collections.Concurrent;
@@ -197,24 +197,27 @@ namespace Snail.Threading
 		public void Run()
 		{
 			MicroLog.Info("Task started " + Task.CurrentId + " ThreadAffinity " + RoundRobinThreadAffinedTaskScheduler.CurrentThreadProcessorIndex);
-			int CHUNK = 1000000;
 			long timeWait = TimeSpan.FromMilliseconds(100).Ticks;
 			while (true)
 			{
-				int  ntasks = 0;
-
 				var q = WaitNextQueue(timeWait);
 				if(q!=null)
 				{
 					try
 					{
-						int count = q.Available;
+						int count = q.Messages.Available;
+#if !CHUNKED
 						for (int i = 0; i < count; i++)
 						{
 							int idx = q.ToIndex(q.Tail);
 							var executor = q.Buffer[idx].Executor;
-#if CHUNKED
-							int chunk = 1;
+							executor(ref q.Buffer[idx]);
+							q.FreeTail();
+						}
+#else
+
+						int chunk = 1;
+						var executor = q.Messages.Buffer[q.Messages.SeqToIdx(q.Messages.Tail)].Executor;
 #if CHUNK_DYN
 							while (chunk < count)
 							{
@@ -225,11 +228,7 @@ namespace Snail.Threading
 #else
 							chunk = count;
 #endif
-							executor(q, chunk);
-#else
-							executor(ref q.Buffer[idx]);
-							q.FreeTail();
-						}
+						executor(q, chunk);
 #endif
 					}
 					catch (Exception ex)
@@ -263,12 +262,12 @@ namespace Snail.Threading
 		public MessageQueue WaitNextQueue(long timeWait)
 		{
 			int cnt = 0;
-			if(_qcache[_nextQueueIdx].Available>0)
+			if(_qcache[_nextQueueIdx].Messages.Available>0)
 				return _qcache[_nextQueueIdx];
 
 			long start = DateTime.UtcNow.Ticks;
 
-			while (_qcache[_nextQueueIdx].WaitForData(0) == 0)
+			while (_qcache[_nextQueueIdx].Messages.WaitForData(0) == 0)
 			{
 				_nextQueueIdx++;
 				if (_nextQueueIdx >= _qcache.Length)

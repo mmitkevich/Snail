@@ -116,6 +116,7 @@
     <Compile Include="Threading\ActorTest.cs" />
     <Compile Include="Threading\ArgsBufferTests.cs" />
     <Compile Include="Threading\BQueueTest.cs" />
+    <Compile Include="Threading\RefAction.cs" />
     <Compile Include="Threading\WorkerPoolTests.cs" />
   </ItemGroup>
   <ItemGroup>

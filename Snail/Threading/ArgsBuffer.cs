@@ -1,118 +1,147 @@
-﻿#define BOXING
+﻿#define BYTEBUF
+//#define SAFE
 
-using System;
-using System.Runtime.InteropServices;
-using System.Threading;
-using Snail.Util;
 
 namespace Snail.Threading
 {
+	using System.Runtime.InteropServices;
 
-	public class ArgsBuffer
+	[StructLayout(LayoutKind.Sequential, Pack = 8)]
+	public unsafe struct ArgsBuffer
 	{
-		public const int ELEMENTS_COUNT = 128*1024;
-		public const int ELEMENT_SIZE = 128;
-#if BOXING
-		private object[] _data;
-#else
-		private byte[] _data;
-#endif
-		private int _maxSize = 1024;
-		private int _size;
+		public const int DefaultCapacity = 128*1024;
+		public const int DefaultElementMaxSize = 8;
 
-		private BQueue<int,BQueueElement<int>> _offsets;
-		private Volatile.PaddedInteger _batchOffset = new Volatile.PaddedInteger(0);
-		private Volatile.PaddedInteger _headOffset = new Volatile.PaddedInteger(0);
-		private Volatile.PaddedInteger _tailOffset = new Volatile.PaddedInteger(0);
+		private object[] _args;
+		private int _capacity;
 
-		public ArgsBuffer() : this(ELEMENTS_COUNT, ELEMENT_SIZE){}
+	#if BYTEBUF
+		private  byte[] _buffer;
+		private int _bufferCapacity;
+		private byte* _pbuffer;
+	#endif
 
-		public ArgsBuffer(int count, int maxSize)
+
+		
+		//private unsafe struct Volatiles
+		//{
+			public fixed long _pad1[8];
+			public int _head;
+			public int _headRef;
+			private byte* _phead;
+			public fixed long _pad2[8];
+			public int _tail;
+			public int _tailRef;
+		//}
+
+		//private Volatiles _x;
+
+		public int Tail
 		{
-			_offsets = new BQueue<int,BQueueElement<int>>(count, -1, true);
-			_maxSize = maxSize;
-#if BOXING
-			_data = new object[count*_maxSize];
-			_size = count * _maxSize - _maxSize;
-#else
-			_data = new byte[count * _maxSize];
-			_size = count*_maxSize-_maxSize;
+			get { return _tail; }
+			set { _tail = Wrap(value); }
+		}
+
+		private int Wrap(int ofs)
+		{
+			if (ofs >= _bufferCapacity)
+				ofs = 0;
+			return ofs;
+		}
+
+		public ArgsBuffer(int capacity, int argsPerMessage
+//#if BYTEBUF
+			, int bytesPerMessage
+//#endif
+			)
+		{
+			//_x = default(Volatiles);
+			_tail = _tailRef = _head = _headRef = 0;
+			_args = new object[capacity * argsPerMessage];
+			_capacity = (capacity-1) * argsPerMessage;
+#if BYTEBUF
+			_buffer = new byte[capacity * bytesPerMessage];
+			_bufferCapacity = (capacity-1) * bytesPerMessage;
+			GCHandle gch = GCHandle.Alloc(_buffer,GCHandleType.Pinned);
+			_phead = _pbuffer = (byte*)gch.AddrOfPinnedObject();
 #endif
 		}
-#if BOXING
-		public object[] GetBuffer()
-#else
-		public byte[] GetBuffer()
-#endif
+
+#if BYTEBUF
+		public byte[] Buffer
 		{
-			return _data;
+			get{return _buffer;}
+		}
+		public int BufferCapacity
+		{
+			get{return _bufferCapacity;}
+		}
+#endif
+		
+		public object[] Args
+		{
+			get { return _args; }
 		}
 
 		public int Capacity
 		{
-			get { return _offsets.Capacity; }
-		}
-		
-		public int Count
-		{
-			get { return _offsets.Count; }
+			get { return _capacity; }
 		}
 
-		public bool BeginWrite(int ticksWait = -1)
+#if BYTEBUF		
+		public void FreeTail<T>()
 		{
-			if (0 == _offsets.WaitForFreeSlots(1, ticksWait))
-				return false;
-			_batchOffset.WriteUnfenced(_headOffset.ReadUnfenced());
-			return true;
+			var ofs = _tail;
+			ofs += ByteArrayUtils.SizeOf<T>();
+			if (ofs >= _bufferCapacity)
+				ofs = 0;
+			_tail = ofs;
 		}
-
-		public void EndWrite()
-		{
-			if (_headOffset.ReadUnfenced() >= _size)
-				_headOffset.WriteUnfenced(0);
-			_offsets.Enqueue(_batchOffset.ReadUnfenced());
-		}
-	
-		public bool BeginRead(int ticksWait=-1)
-		{
-			int seq;
-			if (0 == _offsets.WaitForData(ticksWait))
-				return false;
-			var ofs = _offsets.Dequeue();
-			if(_tailOffset.ReadUnfenced()!=ofs)
-				throw new InvalidOperationException();
-			return true;
-		}
-
-		public void EndRead()
-		{
-			if (_tailOffset.ReadUnfenced()>= _size)
-				_tailOffset.WriteUnfenced(0);
-		}
+#endif
 
 		public T Read<T>() where T:struct
 		{
 			T obj = default(T);
-			var ofs = _tailOffset.ReadUnfenced();
+
+			var ofs = _tail;
 		
-#if BOXING
-			obj = (T) _data[ofs++];
+#if !BYTEBUF
+			obj = (T) _args[ofs++];
+			if (ofs >= _capacity)
+				ofs = 0;
 #else
-			ofs+=Read(ofs, ref obj);
+			ByteArrayUtils.Read(_buffer, ofs, ref obj);
+			FreeTail<T>();
 #endif
-			_tailOffset.WriteUnfenced(ofs);
+			
+			_tail = ofs;
 			return obj;
+		}
+
+		public unsafe void Read<T>(ref T obj) where T : struct
+		{
+			var ofs = _tail;
+#if !BYTEBUF
+			obj = (T) _args[ofs++];
+			if (ofs >= _capacity)
+				ofs = 0;
+#else
+			ByteArrayUtils.Read(_buffer, ofs, ref obj);
+			FreeTail<T>();
+#endif
+
+			_tail = ofs;
 		}
 
 		public T ReadRef<T>() where T:class
 		{
-#if BOXING
+#if !GCHANDLE
 			T obj = default(T);
-			var ofs = _tailOffset.ReadUnfenced();
-
-			obj = (T) _data[ofs++];
-
-			_tailOffset.WriteUnfenced(ofs);
+			var ofs = _tailRef;
+			obj = (T) _args[ofs++];
+			if (ofs >= _capacity)
+				ofs = 0;
+			_tailRef = ofs;
 			return obj;
 #else			
 			GCHandle gch = GCHandle.FromIntPtr(Read<IntPtr>());
@@ -120,59 +149,67 @@ namespace Snail.Threading
 #endif
 		}
 
-		public T GetTail<T>(int shift = 0)
+		public void Write<T>(T obj) where T:struct
 		{
-			T obj = default(T);
-			var ofs = _tailOffset.ReadUnfenced() + shift*ByteArrayUtils.SizeOf<T>();
-			if (ofs < 0)
-				ofs += _size;
-			else if (ofs >= _size)
-				ofs -= _size;
-#if BOXING
-			obj = (T) _data[ofs];
-#else
-			Read(ofs, ref obj);
-#endif
-			return obj;
-		}
-
-		public T GetHead<T>(int shift = 0)
-		{
-			T obj = default(T);
-			var ofs = _headOffset.ReadUnfenced() + shift * ByteArrayUtils.SizeOf<T>();
-			if (ofs < 0)
-				ofs += _size;
-			else if (ofs >= _size)
-				ofs -= _size;
-#if BOXING
-			obj = (T) _data[ofs];
-#else
-			Read(ofs, ref obj);
-#endif
-			return obj;
-		}
-
-		public void Write<T>(T obj) where T:struct 
-		{
-			var ofs = _headOffset.ReadUnfenced();
-#if BOXING
-			_data[ofs]=obj;
+#if !BYTEBUF
+			var ofs = _head;
+			_args[ofs] = obj;
 			ofs++;
-#else			
-			ofs += Write(ofs, ref obj);
+			if (ofs >= _capacity)
+				ofs = 0;
+			_head = ofs;
+#elif SAFE
+			_head = Wrap(_head+Write(_head, ref obj));
+#else
+			//_phead+=ByteArrayUtils.Write(_phead, ref obj);
+			//_phead += ByteArrayUtils.SizeOf<T>();klrea
+			//fixed(byte*p0 = &_buffer[0])
+			//{
+			//	_head = Wrap(_head + ByteArrayUtils.Write(p0+_head, ref obj));
+			//}
+			_phead = WrapPtr(_phead + ByteArrayUtils.Write(_phead, ref obj));
 #endif
-			//if (ofs >= _size)
-			//	ofs = 0;
-			_headOffset.WriteUnfenced(ofs);
+		}
+
+		public void Write<T>(ref T obj) where T : struct
+		{
+#if !BYTEBUF
+			var ofs = _head;
+			_args[ofs] = obj;
+			ofs++;
+			if (ofs >= _capacity)
+				ofs = 0;
+			_head = ofs;
+#elif SAFE
+			var ofs = _head;
+			ofs += Write(ofs, ref obj);
+
+			//ofs %=_bufferCapacity;
+			if (ofs >= _bufferCapacity)
+				ofs = 0;
+			_head = ofs;
+#else
+			//_phead+=ByteArrayUtils.Write(_phead, ref obj);
+			//_phead += ByteArrayUtils.SizeOf<T>();klrea
+			_phead = WrapPtr(_phead + ByteArrayUtils.Write(_phead, ref obj));
+#endif
+		}
+		public byte* WrapPtr(byte*p)
+		{
+			if (p >= _pbuffer + _bufferCapacity)
+				p = _pbuffer;
+			return p;
 		}
 
 		public void WriteRef<T>(T obj) where T:class
 		{
-#if BOXING
-			var ofs = _headOffset.ReadUnfenced();
-			_data[ofs] = obj;
+#if !GCHANDLE
+			var ofs = _headRef;
+			_args[ofs] = obj;
 			ofs++;
-			_headOffset.WriteUnfenced(ofs);
+			if (ofs >= _capacity)
+				ofs = 0;
+			_headRef = ofs;
 #else
 			var gch = GCHandle.Alloc(obj);
 			Write(GCHandle.ToIntPtr(gch));
@@ -185,17 +222,16 @@ namespace Snail.Threading
 			{
 #if IL
 			ldarg.0
-			ldfld uint8[] Snail.Threading.ArgsBuffer::_data
+			ldfld uint8[] Snail.Threading.ArgsBuffer::_buffer
 			ldarg p
 			ldelema [mscorlib]System.Byte 
 			ldarg obj 
-			ldobj !!T
-			stobj !!T
+			cpobj !!T
 			sizeof !!T
 			ret
 #endif
 			}
-			return p;
+			return 0;
 		}
 
 		public int Read<T>(int p, ref T obj)
@@ -205,17 +241,18 @@ namespace Snail.Threading
 #if IL
 			ldarg obj 
 			ldarg.0
-			ldfld uint8[] Snail.Threading.ArgsBuffer::_data
+			ldfld uint8[] Snail.Threading.ArgsBuffer::_buffer
 			ldarg p
 			ldelema [mscorlib]System.Byte 
-			ldobj !!T
-			stobj !!T
+			cpobj !!T
 			sizeof !!T
 			ret
 #endif
 			}
-			return p;
+			return 0;
 		}
+	
+
 	}
 
 
@@ -231,7 +268,49 @@ namespace Snail.Threading
 			return r;
 		}
 
-		public static unsafe byte* Write<T>(byte* p, ref T obj)
+		public static unsafe void Write<T>(byte[] buffer, int p, ref T obj)
+		{
+			if (true)
+			{
+#if IL
+			ldarg buffer
+			ldarg p
+			ldelema [mscorlib]System.Byte 
+			ldarg obj 
+			cpobj !!T
+#endif
+			}
+		}
+
+		public static unsafe void Write<T>(byte[] buffer, int p, T obj)
+		{
+			if (true)
+			{
+#if IL
+			ldarg buffer
+			ldarg p
+			ldelema [mscorlib]System.Byte 
+			ldarg obj 
+			stobj !!T
+#endif
+			}
+		}
+
+		public static unsafe void Read<T>(byte[] buffer, int p, ref T obj)
+		{
+			if (true)
+			{
+#if IL
+			ldarg obj 
+			ldarg buffer
+			ldarg p
+			ldelema [mscorlib]System.Byte 
+			cpobj !!T
+#endif
+			}
+		}
+
+		public static unsafe int Write<T>(byte* p, ref T obj)
 		{
 			if (true)
 			{
@@ -240,16 +319,14 @@ namespace Snail.Threading
 			ldarg obj 
 			cpobj !!T
 			sizeof !!T
-			ldarg p
-			add
-			starg p
+			ret
 #endif
 			}
-			return p;
+			return 0;
 		}
 
 
-		public static unsafe byte* Read<T>(byte* p, ref T obj)
+		public static unsafe int Read<T>(byte* p, ref T obj)
 		{
 			if (true)
 			{
@@ -258,12 +335,10 @@ namespace Snail.Threading
 			ldarg p
 			cpobj !!T
 			sizeof !!T
-			ldarg p
-			add
-			starg p
+			ret
 #endif
 			}
-			return p;
+			return 0;
 		}
 	}
 }

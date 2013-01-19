@@ -1,6 +1,7 @@
-﻿#define DIFF
-//#define CHUNKED
+﻿//#define DIFF
+#define CHUNKED
 //#define FIXED
+#define ARGSBUF
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -73,26 +74,38 @@ namespace Snail.Tests.Threading
 		public RefAction<Message> readPlaceOrder;
 #endif
 
-		private unsafe void VreadPlaceOrder(MessageQueue q, int count)
+		private void VreadPlaceOrder(MessageQueue q, int count)
 		{
-			var tail = q.Tail;
-			var idx = q.ToIndex(tail);
-			var b = q.Buffer;
-			var mask = q.Mask;
+			var tail = q.Messages.Tail;
+			var idx = q.Messages.SeqToIdx(tail);
+			var b = q.Messages.Buffer;
+			var mask = q.Messages.Mask;
+				int WP1=0;
+
 			for (int i = 0; i < count; i++)
 			{
+#if !ARGSBUF
 				_target.PlaceOrder((int)b[idx].WP1, (int)b[idx].WP1, (int)b[idx].WP1);
+#else
+				//var WP1 = args.Read<int>();
+				q.Args.Read<int>(ref WP1);
+				//ByteArrayUtils.Read(q.Args.Buffer, q.Args.Tail, ref WP1);
+				//q.Args.Tail += ByteArrayUtils.SizeOf<int>();
+
+				_target.PlaceOrder(WP1, WP1, WP1);
+#endif
 				b[idx].Executor = null;
 				idx++;
 				idx&=mask;
 			}
-			q.SetTail(tail+count);
+			q.Messages.Tail = tail + count;
 		}
 		[MethodImpl(MethodImplOptions.NoInlining)]
 		private void rPlaceOrder0(ref Message msg)
 		{
 			
 		}
+#if !CHUNKED
 		//[MethodImpl(MethodImplOptions.NoInlining)]
 		private void rPlaceOrder(ref Message msg)
 		{
@@ -109,9 +122,12 @@ namespace Snail.Tests.Threading
 				}
 #else
 			_target.PlaceOrder((int)msg.WP1, (int)msg.WP1, (int)msg.WP1);
+
 			//_target.PlaceOrder(1, 1, 1);
 #endif
 		}
+#endif
+
 #if CHUNKED
 		public Action<MessageQueue,int> readCheck;
 #else
@@ -122,25 +138,32 @@ namespace Snail.Tests.Threading
 		{
 			for (int i = 0; i < count; i++)
 			{
-				rCheck(ref q.Buffer[q.ToIndex(q.Tail)]);
-				q.FreeTail();
+				_target.Check(q.Args.Read<long>());
+//				rCheck(ref q.Buffer[q.SeqToIdx(q.Tail)]);
+				q.Messages.FreeTail();
 			}
 		}
-
 
 		private void rCheck(ref Message msg)	
 		{
 				int s = 0;
+#if ARGSBUF
+			throw new InvalidOperationException();
+#else
 #if FIXED
 				var sum = msg.FixedArgs.Read<long>(ref s);
 #else
 			var sum = (long)msg.WP1;
 #endif
 				_target.Check(sum);
+#endif
 		}
 		//[MethodImpl(MethodImplOptions.NoInlining)]
 		private void wPlaceOrder(ref Message pmsg, int orderId, int price, int volume)
 		{
+#if ARGSBUF
+			throw new InvalidOperationException();
+#else
 #if FIXED
 			fixed (FixedArgs* wa = &pmsg.FixedArgs)
 			{
@@ -156,6 +179,7 @@ namespace Snail.Tests.Threading
 			pmsg.WP1 = orderId;
 			//pmsg.WP2= price;
 			//pmsg.WP3= volume;
+#endif
 #endif
 			//pmsg.Source = Actor.Current;
 			pmsg.Executor = readPlaceOrder;
@@ -179,13 +203,18 @@ namespace Snail.Tests.Threading
 	
 		public void siPlaceOrder(int orderId, int price, int volume)
 		{
+#if !ARGSBUF
 			msg.WP1 = orderId;
+
 			//msg.WP2 = price;
 			//msg.WP3 = volume;
 			//msg.Source = Actor.Current;
 			msg.Executor = readPlaceOrder;
 
 			_target.PlaceOrder((int)msg.WP1, (int)msg.WP1, (int)msg.WP1);
+#else
+			throw new InvalidOperationException();
+#endif
 		}
 
 		private void zPlaceOrder(int orderId,int price, int volume)
@@ -200,27 +229,33 @@ namespace Snail.Tests.Threading
 			if (_mode==Mode.FullQueue)
 #endif
 			{
-				int h = _queue.Head;
-				int ready = _queue.BatchHead-h;
+				var h = _queue.Messages.Head;
+				var ready = _queue.Messages.BatchHead - h;
 				if (ready == 0)
-					_queue.RealWaitForFreeSlots();
+					_queue.Messages.RealWaitForFreeSlots();
 
-				int m = _queue.Mask;
-				int idx = h & m;
-				var b = _queue.Buffer;
+				var m = _queue.Messages.Mask;
+				var idx = h & m;
+				var b = _queue.Messages.Buffer;
 
 				//wPlaceOrder(ref b[idx], orderId, price, volume);
+#if !ARGSBUF				
 				b[idx].WP1 = orderId;
+#else
+				_queue.Args.Write<int>(orderId);
+				//_queue.Args.Write<int>(price);
+				//_queue.Args.Write<int>(volume);
+#endif
 				b[idx].Executor = readPlaceOrder;
 				h++;
-				_queue.Head=h;
+				_queue.Messages.Head = h;
 				//_queue.NextHead();
 
 				if (_queue.TargetMailbox.Comandeer == null)
 					_queue.TargetMailbox.HaveTasks();
 
 			}
-#if DIFF			
+#if DIFF && !ARGSBUF
 			else if(_mode==Mode.SerializeOnly)
 			{
 				wPlaceOrder(ref msg, orderId, price, volume);
@@ -239,6 +274,9 @@ namespace Snail.Tests.Threading
 
 		private void wCheck(ref Message pmsg, long sum)
 		{
+#if ARGSBUF
+			throw new InvalidOperationException();
+#else
 #if FIXED
 			fixed (FixedArgs* wa = &pmsg.FixedArgs)
 			{
@@ -250,6 +288,7 @@ namespace Snail.Tests.Threading
 #else
 			pmsg.WP1= sum;
 #endif		
+#endif
 
 			//pmsg.Source = Actor.Current;
 			pmsg.Executor = readCheck;
@@ -257,22 +296,29 @@ namespace Snail.Tests.Threading
 
 		public void Check(long sum)
 		{
-			if (_mode==Mode.FullQueue)
+			//if (_mode==Mode.FullQueue)
 			{
 				int seq;
-				_queue.WaitForFreeSlots();
-				wCheck(ref _queue.Buffer[_queue.ToIndex(_queue.Head)], sum);
-				_queue.NextHead();
+				_queue.Messages.WaitForFreeSlots(1,-1);
+
+#if !ARGSBUF				
+				wCheck(ref _queue.Buffer[_queue.SeqToIdx(_queue.Head)], sum);
+#else
+				var idx = _queue.Messages.SeqToIdx(_queue.Messages.Head);
+				_queue.Args.Write<long>(ref sum);
+				_queue.Messages.Buffer[idx].Executor = readCheck;
+#endif
+				_queue.Messages.NextHead();
 				
 				_queue.HaveTasks();
 
 				//_target.Mailbox.HaveTasks();
-			}else
+			}/*else
 			{
 				Message msg = default(Message);
 				wCheck(ref msg, sum);
 				rCheck(ref msg);
-			}
+			}*/
 		}
 
 		public void HaveTasks()
@@ -437,10 +483,8 @@ namespace Snail.Tests.Threading
 		public static void a2()
 		{
 			ArgsBuffer bu = new ArgsBuffer();
-			bu.BeginWrite();
 			var a=new SomeObj();
 			bu.WriteRef(a);
-			bu.EndWrite();
 		}
 		public static void Run()
 		{
@@ -491,8 +535,8 @@ namespace Snail.Tests.Threading
 				Run("P1C1", callerProxy);
 				MicroLog.Info("HaveWorks:{0}", impl.Mailbox.HaveWorks);
 				var q = proxy.Queue;
-				MicroLog.Info("Backtracks {0} {1:F4}% EnqFulls {2} {3:F4}", q.Backtrackings,
-				                  (double) 100*q.Backtrackings/q.Tail, q.EnqueueFulls, (double) 100*q.EnqueueFulls/q.Tail);
+				MicroLog.Info("Backtracks {0} {1:F4}% EnqFulls {2} {3:F4}", q.Messages.Backtrackings,
+								  (double)100 * q.Messages.Backtrackings / q.Messages.Tail, q.Messages.EnqueueFulls, (double)100 * q.Messages.EnqueueFulls / q.Messages.Tail);
 
 				Console.ReadKey();
 			}

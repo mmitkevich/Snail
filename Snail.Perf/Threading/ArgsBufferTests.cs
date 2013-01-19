@@ -55,7 +55,7 @@ namespace Snail.Tests.Threading
 					|| A != i || B != -i 
 #endif
 #if STRU_REF
-					|| Buffer != ab
+					//|| Buffer != ab
 #endif
 )
 					return false;
@@ -104,7 +104,7 @@ namespace Snail.Tests.Threading
 
 			struArr = new TArray<StructTest>(SIZE);
 			_arr = new TArray<int>(SIZE);
-			ab = new ArgsBuffer(SIZE, sz);
+			ab = new ArgsBuffer(SIZE, sz,sz);
 			for (int i = 0; i < 3; i++)
 				test1();
 		}
@@ -220,7 +220,7 @@ namespace Snail.Tests.Threading
 				{
 #if STRU
 					stru.Fill(i,ab);
-					p = ab.Write(p, ref stru);
+					ab.Write(ref stru);
 #elif true
 					p = ab.Write(p, ref i);
 #endif
@@ -239,7 +239,7 @@ namespace Snail.Tests.Threading
 				for (int i=0;i<SIZE;i++)
 				{
 #if STRU
-					p = ab.Read(p, ref stru);
+					ab.Read(ref stru);
 					if (!stru.Check(i,ab))
 						throw new InvalidOperationException();
 #elif true
@@ -262,8 +262,8 @@ namespace Snail.Tests.Threading
 				{
 #if STRU
 					stru.Fill(i, ab);
-					pw = ab.Write(pw, ref stru);
-					pr = ab.Read(pr, ref stru);
+					ab.Write(ref stru);
+					ab.Read(ref stru);
 					if (!stru.Check(i, ab))
 						throw new InvalidOperationException();
 #elif true
