@@ -13,7 +13,7 @@ using Disruptor.Scheduler;
 using Snail.Threading;
 using Snail.Util;
 
-namespace Snail.Tests.Threading
+namespace Snail.Tests.Disruptor
 {
 	internal class Security
 	{
@@ -87,7 +87,7 @@ namespace Snail.Tests.Threading
 
 
 			data.Security.Visitors.AtomicDecrementAndGet();
-			MicroLog.Info("{4:13}, Sec {0,10}, Order {1,3}, Owner {2,3} Processed {3,3}", data.Security, data.Id, data.Security.Resource.Owner, Processed, "Exit");
+			MicroLog.Info("{4:13}, Sec {0,10}, Order {1,3}, Owner {2,3} Processed {3,3}", data.Security, data.Id, data.Security.Resource.Owner, Processed, "Exited");
 		}
 	}
 

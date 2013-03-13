@@ -1,7 +1,9 @@
 ﻿#define CHUNKED
 #define MESSAGETEST
-//#define MYMSG
 #define ARGSBUF
+
+#define NO_TARGET_REF
+#define INLINE_WORKLOAD
 
 using System;
 using System.Collections.Generic;
@@ -16,165 +18,301 @@ namespace Snail.Tests.Threading
 {
 	public class BQueueTest
 	{
-		public struct TMessage
-		{
-			public int WP1;
-			public int WP2;
-			public int WP3;
-			public long LP;
-			/*
-			public int WordArg4;
-			public int WordArg5;
-			/*public int WordArg6;*/
 
-			/*public int WordArg0a;
-			public int WordArg1a;
-			public int WordArg2a;
-			public int WordArg3a;
-			public int WordArg4a;
-			public int WordArg5a;
-			public int WordArg6a;*/
-#if true
-			public RefAction<TMessage> Empty;
-			public static RefAction<TMessage> _NotEmpty = method;
-			public const RefAction<TMessage> _Empty = null;
-			private static void method(ref TMessage msg)
+
+		private class Target
+		{
+			public int Value;
+			public void Func(MessageConsumer q, int count)
 			{
-				
-			}
-#else
-			public bool Empty;
-			public const bool _NotEmpty = true;
-			public const bool _Empty = false;
-#endif
-
-	
-		}
-
-		public struct TMessageElement:IBQueueElement<TMessage>
-		{
-			public void InitElement(ref TMessage obj)
-			{
-				//obj = new TMessage();
-			}
-			public void SetEmptyElement(ref TMessage obj)
-			{
-				obj.Empty = TMessage._Empty;
-			}
-
-			public bool IsNonEmptyElement(ref TMessage obj)
-			{
-				return obj.Empty != TMessage._Empty;
-			}
-		}
-#if CHUNKED
-		private static Action<MessageQueue, int> Fake;
-		private static void Fake1(MessageQueue q, int count)
-		{
-			
-		}
-#else
-		private static RefAction<Message> Fake;
-		private static void Fake1(ref Message msg)
-		{
-
-		}
-#endif
-		public static unsafe void Run()
-		{
-			var queueSize = 8*1024*1024;
-			Console.WriteLine("Allocating "+queueSize);
-			var q = 
-#if MESSAGETEST
-#if MYMSG
-				new BQueue<TMessage, TMessageElement>(queueSize);
-#else
-				new MessageQueue(new Mailbox(MailboxScheduler.Current));//, queueSize);
-			var qm = q.Messages;
-#endif
-#else
-				new BQueue<long,BQueueElement<long>>(queueSize);
-						var qm = q;
-#endif
-			int Count =
+				int n =  q.PopArg<int>();
+				if(n!=Value+1)
+				{
+					throw new InvalidOperationException();
+				}
+				Value = n;
 #if DEBUG
-				1024;
-#else
-				32 * 1024 * 1024;
+				Console.WriteLine("DEQ "+Value);
 #endif
-			qm.Pin();
-			Console.WriteLine("Starting " + Count);
-			Fake = Fake1;
-			ManualResetEvent done = new ManualResetEvent(false);
-			for (int k = 0; k <2; k++)
+				var msg = default(Message);
+				q.EndPopCall(ref msg);	// at the end of readiing
+			}
+
+			public void FuncInline(MessageConsumer q, int count)
 			{
-				Report rep = new Report("BQUEUE", "", "");
+				int n = 0;
+				var argsTail = q.ArgsC.ArgsTail;
+				ByteArrayUtils.Read(q.Queue.Args.Buffer, (int)argsTail, ref n);
+				
+				argsTail += ByteArrayUtils.SizeOf<int>();
+				q.ArgsC.ArgsTail = q.Queue.Args.Wrap(argsTail);
+				
+				if (n != Value + 1)
+					throw new InvalidOperationException();
+				Value = n;
+#if DEBUG
+				Console.WriteLine("DEQ " + Value);
+#endif
+				var tail = q.MsgC.Tail;
+				q.Queue.Msgs.SetNull(tail);
+				q.MsgC.Tail = q.Queue.Msgs.Wrap(q.Queue.Msgs.Inc(tail));
+			}
+
+		}
+
+
+		private static Target _target;
+
+		
+		public const int TestRuns = 2;
+#if DEBUG
+		public const int QueueSize = 32;
+		public const int TestCount = 128;
+#else
+		public const int QueueSize = 32*1024*1024;
+		public const int TestCount = 128 * 1024 * 1024;
+#endif
+		public const int ArgsPerMsg = 1;
+		public const int BytesPerMsg = 16;
+
+		public static void Run()
+		{
+			RunPlainCycle("PlainCycle", TestCount);
+			Run("BQueue<int>", new BQueue<int>(QueueSize),
+				TestCount, WriteSimple, ReadSimple, DoneSimple);
+
+			Run("BQueue<int>Inline", new BQueue<int>(QueueSize),
+				TestCount, WriteInline, ReadInline, DoneSimple);
+			
+			Run("MessageQueueInline", new MessageQueue(QueueSize, ArgsPerMsg, BytesPerMsg),
+				TestCount, WriteQueueInline, ReadQueueInline, DoneQueue);
+			
+			//Run("MessageQueue", new MessageQueue(QueueSize, ArgsPerMsg, BytesPerMsg),
+			//	TestCount, WriteQueue, ReadQueue, DoneQueue);
+		}
+
+		private static void RunPlainCycle(string testCase, int TestCount)
+		{
+			Report rep = new Report(testCase, "", "");
+			rep.Run(TestCount,
+				()=>
+				{
+					int ve = 1;
+					for(int i=0;i<TestCount;i++)
+					{
+						if(ve!=i+1)
+							throw new InvalidOperationException();
+						ve++;
+					}
+				}
+				);
+			Console.WriteLine(rep);
+		}
+		
+		private static void ReadSimple(BQueue<int> q, int Count)
+		{
+			int v;
+			int ve = 1;
+			int parts = 4;
+			for (int r = 0; r < parts; r++)
+			{		for (int i = 0; i < Count/parts; i++)
+				{
+					v = q.Dequeue();
+					if(v!=ve)
+						throw new InvalidOperationException();
+					ve++;
+				}
+			Console.WriteLine("QueueFilledAt {0:F2}", (double)q.Count / q.Impl.Buffer.Capacity);
+			}
+		}
+
+		private static void WriteInline(BQueue<int> q, int Count)
+		{
+			for (int i = 0; i < Count; i++)
+			{
+				var h = q.Impl.P.Head;
+				if (q.Impl.Buffer.Subtract(q.Impl.P.BatchHead, h) == 0)
+					q.Impl.P.WaitForFreeSlots(ref q.Impl.Buffer);
+				//q.MsgC.Write(i+1);
+				q.Impl.Buffer[h]=i+1;
+				q.Impl.P.Head = q.Impl.Buffer.AddWrap(q.Impl.P.Head,1);
+			}
+		}
+
+		private static void ReadInline(BQueue<int> q, int Count)
+		{
+			int v;
+			int ve = 1;
+			int parts = 4;
+			for (int r = 0; r < parts; r++)
+			{
+				for (int i = 0; i < Count / parts; i++)
+				{
+					var t = q.Impl.C.Tail;
+					if (q.Impl.Buffer.Subtract(q.Impl.C.BatchTail, t) == 0)
+						q.Impl.C.RealWaitData(ref q.Impl.Buffer);
+					v = q.Impl.Buffer[t];
+					q.Impl.Buffer.SetNull(t);
+					q.Impl.C.Tail = q.Impl.Buffer.AddWrap(t,1);
+
+					if (v != ve)
+						throw new InvalidOperationException();
+					ve++;
+				}
+				Console.WriteLine("QueueFilledAt {0:F2}", (double)q.Count / q.Impl.Buffer.Capacity);
+			}
+		}
+
+		private static void WriteSimple(BQueue<int> q, int Count)
+		{
+			for (int i = 0; i < Count; i++)
+			{
+				q.Enqueue((i + 1));
+			}
+		}
+
+		public static void DoneSimple(BQueue<int> q, int Count)
+		{
+			Console.WriteLine(q.GetQueueStats());
+		}
+
+		private static unsafe void ReadQueue(MessageQueue q, int Count)
+		{
+			for (int i = 0; i < Count; i++)
+			{
+				var cons = q.Consumers[0];
+				cons.WaitCalls();
+				var fun = default(Address);
+				cons.BeginPopCall(ref fun);
+				var obj = cons.PopRef();
+				Address.ExecuteMethod(fun.ToPtr(), obj, cons, 1);
+				
+				if (_target.Value != i + 1)
+					throw new InvalidOperationException();
+			}
+		}
+
+		private static void WriteQueue(MessageQueue q, int Count)
+		{
+			int parts = 4;
+			Address addr = Address.FromDelegate<MessageQueueReader>(_target.Func);
+			int v = 1;
+			for (int r = 0; r < parts;r++ )
+			{
+				for (int i = 0; i < Count / parts; i++)
+				{
+					q.BeginCallsBatch();
+
+					q.BeginPushCall(addr);
+					q.PushRef(_target);
+					q.PushArg(v);
+					q.EndPushCall(addr);
+#if DEBUG
+					Console.WriteLine("ENQ "+v);
+#endif
+					v++;
+				}
+				Console.WriteLine("QueueFilledAt {0:F2}", (double)q.Consumers[0].Count/ q.Capacity);
+			}
+		}
+
+		private static unsafe void ReadQueueInline(MessageQueue q, int Count)
+		{
+			var cons = q.Consumers[0];
+			if (cons == null)
+				throw new InvalidOperationException();
+
+			for (int i = 0; i < Count; i++)
+			{
+				if (cons.MsgC.Tail == cons.MsgC.BatchTail)
+					cons.MsgC.RealWaitData(ref q.Msgs);
+
+#if NO_TARGET_REF
+				var obj = _target;
+#else
+				var refsTail = cons.ArgsC.RefsTail; 
+				var obj = q.Refs.Buffer[(int)refsTail];
+				refsTail++;
+				cons.ArgsC.RefsTail = refsTail >= q.Refs.Buffer.Length ? 0 : refsTail;
+#endif
+
+#if INLINE_WORKLOAD
+				_target.FuncInline(cons, 1);
+#else
+				var fun = q.Messages[(int)cons.MsgC.Tail];
+				Address.ExecuteMethod(fun.ToPtr(), obj, cons, 1);
+#endif
+
+				if (_target.Value != i + 1)
+					throw new InvalidOperationException();
+			}
+		}
+
+		private static void WriteQueueInline(MessageQueue q, int Count)
+		{
+			int parts = 4;
+			Address addr = Address.FromDelegate<MessageQueueReader>(_target.FuncInline);
+			int v = 1;
+			Message msg = default(Message);
+			for (int r = 0; r < parts; r++)
+			{
+				for (int i = 0; i < Count / parts; i++)
+				{
+					if (q.MsgP.GetSlotsAvailable(ref q.Msgs) == 0)
+						q.MsgP.BeginBatch(ref q.Msgs);
+
+					
+#if NO_TARGET_REF
+#else
+					var refsHead = q.ArgsP.RefsHead;
+					q.Refs[(int)refsHead] = _target;
+					refsHead++;
+					q.ArgsP.RefsHead = refsHead >= q.Refs.Buffer.Length ? 0 : refsHead;
+#endif
+
+					//var argsHead = q.ArgsP.ArgsHead;
+					//ByteArrayUtils.Write(argsHead, ref v);
+					//q.ArgsP.ArgsHead = q.Args.AddWrap(argsHead,sizeof (int));
+					q.ArgsP.Write(ref q.Args, v);
+
+					var head = q.MsgP.Head;
+					q.Msgs[head] = new Message(addr);
+					q.MsgP.MoveNext(ref q.Msgs);
+#if DEBUG
+					Console.WriteLine("ENQ "+v);
+#endif
+					v++;
+				}
+				Console.WriteLine("QueueFilledAt {0:F2}", (double)q.Consumers[0].Count / q.Capacity);
+			}
+		}
+
+		public static void DoneQueue(MessageQueue q,int Count)
+		{
+			Console.WriteLine(q.GetQueueStats());
+		}
+		
+		public static unsafe void Run<TQueue>(string testCase, TQueue q, int Count, Action<TQueue,int> Write, Action<TQueue,int> Read, Action<TQueue,int> Done)
+		{
+			//qm.Pin();
+			ManualResetEvent done = new ManualResetEvent(false);
+
+			var abook = new AddressBook();
+
+			for (int k = 0; k < TestRuns; k++)
+			{
+				_target = new Target();
+
+				Report rep = new Report(testCase, "", "");
 				rep.Run(Count, () =>
 				{
-					var t = Task.Factory.StartNew(() =>
-					{
-						int v = 0;
-						int seq;
-
-						void* pmsg = qm.BufferPtr;
-
-						for (int i = 0; i < Count; i++)
-						{
-#if MESSAGETEST
-							qm.WaitForData();
-							int idx = qm.SeqToIdx(qm.Tail);
-							var b = qm.Buffer;
-#if ARGSBUF							
-							v=q.Args.Read<int>();
-#else
-							v = (int) b[idx].WP1;
-#endif
-							qm.FreeTail();
-#else
-							v = (int) q.Dequeue();
-#endif
-							//if (v != i + 1)
-							//	throw new InvalidOperationException();
-						}
-						Console.WriteLine("DEQ DONE");
-					});
-					int ve = 1;
-					int parts = 4;
-					Message msg=default(Message);
-					for (int r = 0; r < parts;r++ )
-					{
-						for (int i = 0; i < Count / parts; i++)
-						{
-							ve++;					
-#if MESSAGETEST							
-							if(qm.Tail==qm.BatchTail)
-								qm.RealWaitForFreeSlots();
-
-							int idx = (int)(qm.Head & qm.Mask);
-#if !ARGSBUF							
-							q.Buffer[idx].WP1 = ve;
-#else
-							q.Args.Write(ve);
-#endif
-#if MYMSG
-							q.Buffer[idx].Empty = TMessage._NotEmpty;
-#else
-							qm.Buffer[idx].Executor = Fake;
-#endif
-							qm.Head = qm.NextSeq(qm.Head);
-#else
-							q.Enqueue(ve);
-#endif
-
-						}
-						Console.WriteLine("QS {0:F2}", (double)q.Messages.Count / q.Messages.Capacity);
-					}
+					var t = Task.Factory.StartNew(() => { Read(q, Count);Console.WriteLine("DEQ DONE"); });
+					Write(q, Count);
 					Console.WriteLine("ENQ DONE");
 					t.Wait();
+					Done(q, Count);
 				});
 				Console.WriteLine(rep);
-				Console.WriteLine("Backtracks {0} {1:F4}% EnqFulls {2} {3:F4}", q.Messages.Backtrackings,
-								  (double)100 * q.Messages.Backtrackings / Count, q.Messages.EnqueueFulls, (double)100 * q.Messages.EnqueueFulls / Count);
 			}
 		}
 	}

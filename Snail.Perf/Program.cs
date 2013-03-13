@@ -9,7 +9,7 @@ namespace Snail.Tests
 			BQueueTest.Run();
 			//ArgsBufferTests.test();
 			//WorkerPoolTests.Run();
-			ActorTest.Run();
+			//ActorTest.Run();
 		}
 	}
 }

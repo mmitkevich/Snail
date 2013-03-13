@@ -1,7 +1,10 @@
 ﻿#define ADAPTIVE
 #define POWER2BUFFER
 #define STATS
+#define INLINEWAIT
 
+using System.Runtime.CompilerServices;
+using System.Text;
 
 /*
 * B-Queue -- An efficient and practical queueing for fast core-to-core
@@ -38,554 +41,988 @@ namespace Snail.Threading
 	using Snail.Util;
 	
 	
-	public interface IBQueueElement<T>
+	public interface IBQueueBuffer
 	{
-		void InitElement(ref T obj);
-		void SetEmptyElement(ref T obj);
-		bool IsNonEmptyElement(ref T obj);
+		int Capacity{get;}
+		void Init(int capacity);
+		IntPtr BufferPtr { get; }
+		//IntPtr GetElementPtr(int idx);
 	}
 
-	public struct BQueueElement<T>:IBQueueElement<T>
+	public interface IBQueueBuffer<T>:IBQueueBuffer 
 	{
-		private readonly T _emptyElement;
+		T[] Buffer { get; }
+	}
 
-		public BQueueElement(T emptyElement)
+	public unsafe interface IBQueueBuffer<T,TIndex>:IBQueueBuffer<T> where TIndex:struct
+	{
+		TIndex Add(TIndex seq, int shift);
+		TIndex AddWrap(TIndex seq, int shift);
+		TIndex Inc(TIndex seq);
+		TIndex Wrap(TIndex seq);
+		int Subtract(TIndex left, TIndex right);
+		int ToIndex(TIndex seq);
+		IntPtr ToPointer(TIndex seq);
+		T this[TIndex seq] { get; set; }
+		bool IsNull(TIndex seq);
+		void SetNull(TIndex seq);
+		long ToLong(TIndex seq);
+		INullValue<T> NullValue { get; }
+	}
+
+	public interface IBArgsBuffer<T,TIndex>:IBQueueBuffer<T,TIndex> where TIndex:struct
+	{
+		TIndex Write<TValue>(TIndex seq, TValue value) where TValue:struct;
+		TIndex Read<TValue>(TIndex seq, ref TValue value) where TValue:struct;
+	}
+
+	public interface INullValue<T>
+	{
+		bool IsNull(ref T value);
+		void SetNull(ref T value);
+		bool IsNull(IntPtr ptr);
+		void SetNull(IntPtr ptr);
+	}
+
+	public struct RefsNullValue:INullValue<object>
+	{
+		public bool IsNull(ref object value)
 		{
-			_emptyElement = emptyElement;
+			return value == null;
 		}
 
-		public void InitElement(ref T val)
+		public void SetNull(ref object value)
 		{
-			
+			value = null;
 		}
 
-		public bool IsNonEmptyElement(ref T val)
+		public bool IsNull(IntPtr ptr)
+		{
+			var handle = GCHandle.FromIntPtr(ptr);
+			return handle.Target == null;
+		}
+
+		public void SetNull(IntPtr ptr)
+		{
+			var handle = GCHandle.FromIntPtr(ptr);
+			handle.Target = null;
+		}
+	}
+
+	public struct NullValue<T>:INullValue<T>
+	{
+		public static T Null;
+
+		public bool IsNull(ref T val)
 		{
 			if (true)
 			{
 #if IL
 				ldarg val
 				ldobj !0
-				ldarg.0
-				ldfld !0 valuetype Snail.Threading.BQueueElement`1<!T>::_emptyElement
-				sub
+				ldsfld !0 valuetype Snail.Threading.NullValue`1<!T>::Null
+				ceq
 				ret
 #endif
 			}
-			return !object.Equals(val,_emptyElement);
+			return !object.Equals(val, Null);
 		}
 
-		public void SetEmptyElement(ref T val)
+		public bool IsNull(IntPtr ptr)
 		{
-			val = _emptyElement;
+			if (true)
+			{
+#if IL
+				ldarg ptr
+				ldobj !0
+				ldsfld !0 valuetype Snail.Threading.NullValue`1<!T>::Null
+				ceq
+				ret
+#endif
+			}
+			return !object.Equals(ptr, Null);
+		}
+
+		public void SetNull(ref T val)
+		{
+			val = Null;
+		}
+
+		public void SetNull(IntPtr ptr)
+		{
+			if (true)
+			{
+#if IL
+				ldarg ptr
+				ldsfld !0 valuetype Snail.Threading.NullValue`1<!T>::Null
+				stobj !0
+#endif
+			}
 		}
 	}
 
-	
-
-	public sealed unsafe class BQueue<T, THelper> : IProducerConsumerCollection<T> where THelper:IBQueueElement<T>  
+	public struct BQueueBufferImpl<T,TNullValue> where TNullValue:struct,INullValue<T>
 	{
-		public const int DefaultCapacity = 64*1024;
+		public T[] Buffer;
+		public GCHandle GCHandle;
+		public IntPtr BufferPtr;
+		public TNullValue NullValue;
 
-		public const int NoWait = 0;
-		public const int BlockWait = -1;
 
-		private int _consumerBatchSize;
-		private int _producerBatchSize;
-		private int _batchIncrement;
-
-		private int _capacity;
-		private int _mask;
-		private T[] _buffer;
-
-		private int _batch_history;
-
-		private SpinWait _wt = new SpinWait();
-		public THelper Helper = default(THelper);
-
-		public void* BufferPtr
+		public void Init(int capacity)
 		{
-			get { return _x.BufferPtr; }
-		}
-
-		[StructLayout(LayoutKind.Sequential, Pack=8)]
-		private unsafe struct QueueData
-		{
-			public long Head;
-			public long BatchHead;
-			public void* BufferPtr;
-
-#if STATS			
-			public long EnqueueFulls;
-#endif
-			private fixed long _pad2 [8];
-			public long Tail;
-			public long BatchTail;
-#if STATS
-			public long _backtrackings;
-#endif
-		}
-
-		private GCHandle _gch;
-		private QueueData _x = default(QueueData);
-
-		
-		public long EnqueueFulls
-		{
-			get
+			Buffer = new T[capacity];
+			BufferPtr = IntPtr.Zero;
+			for (int i = 0; i < Buffer.Length; i++)
 			{
-	#if STATS
-				return _x.EnqueueFulls;
-	#endif
+				NullValue.SetNull(ref Buffer[i]);
 			}
-		}
-
-		public long Backtrackings
-		{
-			get
-			{
-	#if STATS
-				return _x._backtrackings;
-	#endif
-			}
-		}
-
-		public int Mask
-		{
-			get { return _mask; }
-		}
-
-		public int Capacity
-		{
-			get { return _capacity; }
-		}
-
-		public T[] Buffer
-		{
-			get { return _buffer; }
-		}
-
-		public BQueue() : this(DefaultCapacity)
-		{
-		}
-		
-		public BQueue(int capacity)
-		{
-			_capacity = capacity;
-
-#if POWER2BUFFER
-			//if(capacity^(capacity+1))
-			_mask = capacity - 1;
-#endif
-			_consumerBatchSize = _producerBatchSize = _capacity/16;
-			_batchIncrement = _capacity/32;
-
-			_buffer = new T[_capacity];
-
-			for (int i = 0; i < _buffer.Length; i++)
-				Helper.InitElement(ref _buffer[i]);
-
-			_batch_history = _consumerBatchSize;
 		}
 
 		public void Pin()
 		{
-			if (!_gch.IsAllocated)
-				_gch = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
-			_x.BufferPtr = (void*)_gch.AddrOfPinnedObject();
+			if (!GCHandle.IsAllocated)
+				GCHandle = GCHandle.Alloc(Buffer, GCHandleType.Pinned);
+			BufferPtr = GCHandle.AddrOfPinnedObject();
 		}
 
 		public void Unpin()
 		{
-			if(_gch.IsAllocated)
-				_gch.Free();
-			_x.BufferPtr = null;
+			if (GCHandle.IsAllocated)
+				GCHandle.Free();
+			BufferPtr = IntPtr.Zero;
 		}
 
-		private void WaitTicks()
+		public IntPtr GetElementPtr(int idx)
 		{
-			//if(!_wt.NextSpinWillYield)
-				_wt.SpinOnce();
+			return IntPtr.Add(BufferPtr, idx * ByteArrayUtils.SizeOf<T>());
 		}
 
-		public long Head
+	}
+	/// <summary>
+	/// Safe ringbuffer implementation with manual index wrapping.
+	/// </summary>
+	/// <typeparam name="T"></typeparam>
+	/// <typeparam name="TNullValue"></typeparam>
+	public struct BRingBuffer<T, TNullValue> : IBQueueBuffer<T, int>
+		where TNullValue : struct,INullValue<T>
+	{
+		public BQueueBufferImpl<T, TNullValue> Impl;
+
+		public INullValue<T> NullValue
 		{
-			get { return _x.Head; }
-			set { _x.Head = ToSeq(value); }
+			get { return Impl.NullValue; }
 		}
 
-		public long BatchHead
+		public T[] Buffer
 		{
-			get { return _x.BatchHead; }
+			get { return Impl.Buffer; }
 		}
 
-		public int SeqToIdx(long seq)
+		public int Capacity
 		{
-#if POWER2BUFFER
-			return (int)(seq & _mask);
-#else
-			return (int) seq;
-#endif
+			get { return Impl.Buffer.Length; }
+		}
+
+		public void Init(int capacity)
+		{
+			Impl.Init(capacity);
+		}
+
+		public IntPtr BufferPtr
+		{
+			get { return Impl.BufferPtr; }
+		}
+
+		public IntPtr GetElementPtr(int idx)
+		{
+			return Impl.GetElementPtr(idx);
+		}
+
+		public int Inc(int seq)
+		{
+			return seq + 1;
+		}
+
+		public int Add(int seq, int shift)
+		{
+			return seq + shift;
+		}
+
+		public int AddWrap(int seq, int shift)
+		{
+			return Wrap(seq+shift);
+		}
+
+		public int Subtract(int left, int right)
+		{
+			int d = left - right;
+			if (d < 0)
+				d += Capacity;
+			return d;
+		}
+
+		public int ToIndex(int seq)
+		{
+			return seq;
+		}
+
+		public int Wrap(int seq)
+		{
+			return seq >= Capacity ? 0 : seq;
+		}
+
+		public long ToLong(int seq)
+		{
+			return seq;
+		}
+
+		public T this[int seq]
+		{
+			get { return Buffer[seq]; }
+			set { Buffer[seq] = value; }
 		}
 		
-		public long NextHead()
+		public long Read<TValue>(int seq, ref TValue value) where TValue : struct
 		{
-			var head = NextSeq(_x.Head);
-			_x.Head = head;
-			return head;
+			ByteArrayUtils.Read(Impl.Buffer, seq, ref value);
+			return seq + ByteArrayUtils.SizeOf<TValue>();
 		}
-	
-		public long Tail
+
+		public long Write<TValue>(int seq, ref TValue value) where TValue : struct
 		{
-			get { return _x.Tail; }
-			set
+			ByteArrayUtils.Read(Impl.Buffer, seq, ref value);
+			return seq + ByteArrayUtils.SizeOf<TValue>();
+		}
+
+
+		public bool IsNull(int seq)
+		{
+			return NullValue.IsNull(ref Impl.Buffer[seq]);
+		}
+
+		public void SetNull(int seq)
+		{
+			NullValue.SetNull(ref Impl.Buffer[seq]);
+		}
+
+		public IntPtr ToPointer(int seq)
+		{
+			return GetElementPtr(seq);
+		}
+	}
+
+	/// <summary>
+	/// Safe ringbuffer with CAPACITY = 2^n implementation using 64bit sequence.
+	/// Array index is produced by bitwise AND operation with MASK = 2^n-1.
+	/// Should be somewhat faster than <see cref="BRingBuffer{T,TNullValue}"/>.
+	/// </summary>
+	/// <typeparam name="T"></typeparam>
+	/// <typeparam name="TNullValue"></typeparam>
+	public struct BRing2Buffer<T, TNullValue> : IBQueueBuffer<T, long>
+		where TNullValue : struct,INullValue<T>
+	{
+		public BQueueBufferImpl<T, TNullValue> Impl;
+
+		public INullValue<T> NullValue
+		{
+			get { return Impl.NullValue; }
+		}
+
+		public T[] Buffer
+		{
+			get { return Impl.Buffer; }
+		}
+
+		public int Capacity
+		{
+			get { return Impl.Buffer.Length; }
+		}
+
+		public void Init(int capacity)
+		{
+			Impl.Init(capacity);
+		}
+
+		public IntPtr BufferPtr
+		{
+			get { return Impl.BufferPtr; }
+		}
+
+		public IntPtr GetElementPtr(int idx)
+		{
+			return Impl.GetElementPtr(idx);
+		}
+
+		public long Inc(long seq)
+		{
+			return seq + 1;
+		}
+
+		public long Add(long seq, int shift)
+		{
+			return seq + shift;
+		}
+
+		public long AddWrap(long seq, int shift)
+		{
+			return seq + shift;
+		}
+
+		public int Subtract(long left, long right)
+		{
+			return (int)(left - right);
+		}
+
+		public int ToIndex(long seq)
+		{
+			return (int)seq & (Impl.Buffer.Length - 1);
+		}
+
+		public long Wrap(long seq)
+		{
+			return seq;
+		}
+
+		public long ToLong(long seq)
+		{
+			return seq;
+		}
+
+		public T this[long seq]
+		{
+			get{ return Buffer[ToIndex(seq)]; }
+			set { Buffer[ToIndex(seq)] = value; }
+		}
+
+		public bool IsNull(long seq)
+		{
+			return Impl.NullValue.IsNull(ref Impl.Buffer[ToIndex(seq)]);
+		}
+
+		public void SetNull(long seq)
+		{
+			Impl.NullValue.SetNull(ref Impl.Buffer[ToIndex(seq)]);
+		}
+
+		public IntPtr ToPointer(long seq)
+		{
+			return GetElementPtr(ToIndex(seq));
+		}
+
+		public long Read<TValue>(long seq, ref TValue value) where TValue : struct
+		{
+			ByteArrayUtils.Read(Impl.Buffer,ToIndex(seq),ref value);
+			return seq + ByteArrayUtils.SizeOf<TValue>();
+		}
+
+		public long Write<TValue>(long seq, ref TValue value) where TValue : struct
+		{
+			ByteArrayUtils.Read(Impl.Buffer, ToIndex(seq), ref value);
+			return seq + ByteArrayUtils.SizeOf<TValue>();
+		}
+	}
+
+	/// <summary>
+	/// Unsafe pinned ringbuffer implementation using pointers.
+	/// </summary>
+	/// <typeparam name="T"></typeparam>
+	/// <typeparam name="TNullValue"> </typeparam>
+	public struct BPinnedRingBuffer<T, TNullValue> : IBArgsBuffer<T, IntPtr>
+		where TNullValue : struct,INullValue<T>
+	{
+		public BQueueBufferImpl<T, TNullValue> Impl;
+
+		public INullValue<T> NullValue
+		{
+			get { return Impl.NullValue; }
+		}
+
+		public T[] Buffer
+		{
+			get { return Impl.Buffer; }
+		}
+
+		public int Capacity
+		{
+			get { return Impl.Buffer.Length; }
+		}
+
+		public void Init(int capacity)
+		{
+			Impl.Init(capacity);
+		}
+
+		public IntPtr BufferPtr
+		{
+			get { return Impl.BufferPtr; }
+		}
+
+		public IntPtr GetElementPtr(int idx)
+		{
+			return Impl.GetElementPtr(idx);
+		}
+
+		public IntPtr Inc(IntPtr seq)
+		{
+			return seq + 1;
+		}
+
+		public IntPtr Add(IntPtr seq, int shift)
+		{
+			return seq + shift;
+		}
+
+		public IntPtr AddWrap(IntPtr seq, int shift)
+		{
+			return Wrap(seq + shift);
+		}
+
+		public int Subtract(IntPtr left, IntPtr right)
+		{
+			return ByteArrayUtils.Subtract<T>(left, right);
+		}
+
+		public int ToIndex(IntPtr seq)
+		{
+			return Subtract(seq, BufferPtr);
+		}
+
+		public IntPtr Wrap(IntPtr seq)
+		{
+			return ByteArrayUtils.Subtract<T>(seq, BufferPtr) >= Capacity ? BufferPtr : seq;
+		}
+
+		public long ToLong(IntPtr seq)
+		{
+			return seq.ToInt64();
+		}
+
+		public T this[IntPtr seq]
+		{
+			get { return ByteArrayUtils.Read<T>(seq); }
+			set { ByteArrayUtils.Write(seq, value); }
+		}
+
+		public bool IsNull(IntPtr seq)
+		{
+			return Impl.NullValue.IsNull(seq);
+		}
+
+		public void SetNull(IntPtr seq)
+		{
+			Impl.NullValue.SetNull(seq);
+		}
+
+		public IntPtr ToPointer(IntPtr seq)
+		{
+			return seq;
+		}
+
+		public IntPtr Read<TValue>(IntPtr seq, ref TValue value) where TValue : struct
+		{
+			ByteArrayUtils.Read(seq, ref value);
+			return IntPtr.Add(seq,ByteArrayUtils.SizeOf<TValue>());
+		}
+
+		public IntPtr Write<TValue>(IntPtr seq, TValue value) where TValue : struct
+		{
+			ByteArrayUtils.Write(seq, ref value);
+			return IntPtr.Add(seq, ByteArrayUtils.SizeOf<TValue>());
+		}
+	}
+
+	public static class BQWait
+	{
+		public const int NoWait = 0;
+		public const int BlockWait = -1;
+	}
+
+	public interface IBQConsumer<T, TBuffer>
+	{
+		int WaitData(ref TBuffer buf, int ticksWait = BQWait.BlockWait);
+		void MoveNext(ref TBuffer buf);
+		T Read(ref TBuffer buf);
+		//void Init(int count);
+		void UpdateQueueStat(BQueueStat stat);
+	}
+
+	[StructLayout(LayoutKind.Sequential, Pack = 8)]
+	public unsafe struct BQConsumer<T, TBuffer, TSequence> : IBQConsumer<T, TBuffer>
+		where TBuffer : IBQueueBuffer<T, TSequence>
+		where TSequence : struct
+
+	{
+		private fixed long _pad1[8];
+		// consumer only
+		public TSequence Tail;
+		public TSequence BatchTail;
+		public int BatchHistory;
+
+		private int BatchIncrement;
+		private int ConsumerBatchSize;
+#		if STATS
+		public long Backtrackings;
+#		endif
+
+		private fixed long _pad2[8];
+
+		public void Init(int capacity)
+		{
+			ConsumerBatchSize = capacity / 16;
+			BatchIncrement = capacity / 32;
+			BatchHistory = ConsumerBatchSize;
+			Backtrackings = 0;
+		}
+
+		public int GetAvailable(ref TBuffer buf)
+		{
+			return buf.Subtract(BatchTail,Tail); 
+		
+		}
+		
+		public void UpdateQueueStat(BQueueStat stat)
+		{
+			stat.Backtrackings += Backtrackings;
+		}
+
+
+		public int WaitData(ref TBuffer buf, int ticksWait = BQWait.BlockWait)
+		{
+			var ready = buf.Subtract(BatchTail, Tail);
+			if (ready > 0)
+				return ready;
+			return RealWaitData(ref buf, ticksWait);
+		}
+
+		public void MoveNext(ref TBuffer buf)
+		{
+			//_nullValue.SetNull(ref buf.Buffer[Tail.ToIndex(ref buf)]);
+			buf.SetNull(Tail);
+			Tail = buf.AddWrap(Tail,1);
+		}
+
+		public int RealWaitData(ref TBuffer buf, int ticksWait = BQWait.BlockWait)
+		{
+			int ready;
+			if ((ready = Backtracking(ref buf)) == 0 && ticksWait != BQWait.NoWait)
 			{
-				_x.Tail = ToSeq(value);
+				long start = DateTime.UtcNow.Ticks;
+				do
+				{
+					default(SpinWait).SpinOnce();
+					if (ticksWait > 0 && (int)(DateTime.UtcNow.Ticks - start) > ticksWait)
+					{
+						return 0;
+					}
+				} while ((ready = Backtracking(ref buf)) == 0);
 			}
+			return ready;
 		}
 
-		public long BatchTail
+		private int Backtracking(ref TBuffer buf)
 		{
-			get { return _x.BatchTail; }
-		}
+#			if STATS
+			Backtrackings++;
+#			endif
 
-		private long ToSeq(long arg)
-		{
-#if !POWER2BUFFER
-			var sz = _size;
-			while(arg>sz)
-				arg-=sz;
+			var tail = Tail;
+			var batchTail = tail;
+
+			batchTail = buf.Add(batchTail,BatchHistory);
+			//tmp_tail += ConsumerBatchSize;
+
+#if ADAPTIVE
+			if (BatchHistory < ConsumerBatchSize)
+			{
+				BatchHistory =
+					(ConsumerBatchSize < (BatchHistory + BatchIncrement)) ?
+					ConsumerBatchSize : (BatchHistory + BatchIncrement);
+			}
 #endif
-			return arg;
+
+			var batchSize = BatchHistory;
+
+			//while (IsNull(ref buf, batchTail))
+			while (buf.IsNull(batchTail))
+			{
+				if (batchSize == 0)
+					return 0;
+
+				//WaitTicks();
+
+				batchSize = batchSize >> 1;
+				batchTail = tail;
+				batchTail = buf.Add(batchTail,batchSize);
+			}
+#if ADAPTIVE
+			BatchHistory = batchSize;
+#endif
+
+			if (buf.Subtract(batchTail,tail) == 0)
+				batchTail = buf.AddWrap(batchTail,1);
+			BatchTail = batchTail;
+			return buf.Subtract(batchTail,tail);
 		}
 
-		public int Available
+
+		public bool TryDequeue(ref TBuffer buf, out T value, int ticksWait = BQWait.NoWait)
 		{
-			get { return (int)(_x.BatchTail - _x.Tail); }
+			if (WaitData(ref buf, ticksWait) == 0)
+			{
+				value = default(T);
+				return false;
+			}
+
+			value = Read(ref buf);
+
+			return true; //SUCCESS
+		}
+
+		public T Dequeue(ref TBuffer buf)
+		{
+			var tail = Tail;
+#if INLINEWAIT
+			if (buf.Subtract(BatchTail,tail)==0)
+#endif
+				RealWaitData(ref buf);
+			T value = buf[tail];
+			//MoveNext(ref buf);
+			//_nullValue.SetNull(ref buf.Buffer[Tail.ToIndex(ref buf)]);
+			buf.SetNull(tail); ;
+			Tail = buf.AddWrap(tail,1);
+			return value;
+		}
+
+		public T Read(ref TBuffer buf)
+		{
+			T value = buf[Tail];
+#if DEBUG
+			if (buf.IsNull(Tail) || buf.NullValue.IsNull(ref value))
+				throw new InvalidOperationException("Read null at "+Tail);
+#endif
+
+			//MoveNext(ref buf);
+			buf.SetNull(Tail);
+			Tail = buf.AddWrap(Tail,1);
+			return value;
+		}
+	}
+
+
+	
+	public interface IBQProducer<T,TBuffer>
+	{
+		int BeginBatch(ref TBuffer buf, int batchSize = 1, int ticksWait = BQWait.BlockWait);
+		void MoveNext(ref TBuffer buf);
+		void Write(ref TBuffer buf, T value);
+	}
+
+	[StructLayout(LayoutKind.Sequential, Pack = 8)]
+	public unsafe struct BQProducer<T, TBuffer, TSequence> : IBQProducer<T,TBuffer> 
+		where TBuffer : IBQueueBuffer<T,TSequence>
+		where TSequence:struct
+
+	{
+		private fixed long _pad1[8];
+		// producer only
+		private int ProducerBatchSize;
+		public TSequence Head;
+		public TSequence BatchHead;
+#		if STATS
+		public long EnqueueFulls;
+#		endif
+		private fixed long _pad2[8];
+
+
+		public void Init(int capacity)
+		{
+			ProducerBatchSize = capacity / 16;
+			EnqueueFulls = 0;
+		}
+
+		public int GetSlotsAvailable(ref TBuffer buf)
+		{
+			return buf.Subtract(BatchHead, Head); 
+		}
+
+		public int BeginBatch(ref TBuffer buf, int batchSize = 1, int ticksWait = BQWait.BlockWait)
+		{
+			var size = buf.Subtract(BatchHead, Head);
+
+			if (size >= batchSize)
+			{
+#if DEBUG
+				if(!S.IsNull(ref buf, Head, NullValue))
+					throw new InvalidOperationException();
+#endif
+				return size;
+			}
+
+			return WaitForFreeSlots(ref buf, batchSize, ticksWait);
+		}
+
+		public void MoveNext(ref TBuffer buf)
+		{
+			Head = buf.AddWrap(Head,1);
+		}
+
+
+
+		public int WaitForFreeSlots(ref TBuffer buf, int batchSize = 1, int ticksWait = BQWait.BlockWait)
+		{
+			var head = Head;
+			var batchHead = BatchHead;
+
+			if (batchSize < ProducerBatchSize)
+				batchSize = ProducerBatchSize;
+
+			batchHead = buf.Add(batchHead, batchSize);
+
+			//if (!IsNull(ref buf, batchHead))
+			if (!buf.IsNull(batchHead))
+			{
+#				if STATS
+				EnqueueFulls++;
+#				endif
+				if (ticksWait != BQWait.NoWait)
+				{
+					long start = DateTime.UtcNow.Ticks;
+					do
+					{
+						default(SpinWait).SpinOnce();
+						if (ticksWait > 0 && (int) (DateTime.UtcNow.Ticks - start) > ticksWait)
+						{
+							return 0;
+						}
+					} //while (!IsNull(ref buf, batchHead));
+					while (!buf.IsNull(batchHead));
+				}
+			}
+			BatchHead = batchHead;
+#if DEBUG
+			if (!S.IsNull(ref buf,head,NullValue))
+				throw new InvalidOperationException();
+#endif
+			return buf.Subtract(batchHead, head);
+		}
+
+		public bool TryEnqueue(ref TBuffer buf, T value, int ticksWait = BQWait.NoWait)
+		{
+			if (0 == BeginBatch(ref buf, 1, ticksWait))
+				return false;
+
+			Write(ref buf, value);
+			return true;
+		}
+
+		public bool TryEnqueue(ref TBuffer buf, RefAction<long, T> translator, int ticksWait = BQWait.NoWait)
+		{
+			if (0 == BeginBatch(ref buf, 1, ticksWait))
+				return false;
+
+			Enqueue(ref buf, translator);
+			return true;
+		}
+
+		public void Enqueue(ref TBuffer buf, T value)
+		{
+			var head = Head;
+#if INLINEWAIT
+			if (buf.Subtract(BatchHead, head) == 0)
+				WaitForFreeSlots(ref buf);
+#else
+			BeginBatch(ref buf);
+#endif
+			
+
+#if DEBUG
+			if (NullValue.IsNull(ref value))
+				throw new InvalidOperationException("Value shoud be non-empty " + value);
+#endif
+			buf[head]=value;
+			Head = buf.AddWrap(head,1);
+			
+			//var head = Head.ToLong();
+			//buf.Buffer[head & (buf.Capacity - 1)] = value;
+			//head++;
+			//Head.FromLong(head);
+		}
+
+		public void Write(ref TBuffer buf, T value)
+		{
+			var head = Head;
+#if DEBUG
+			if (NullValue.IsNull(ref value))
+				throw new InvalidOperationException("Value should be non-empty " + value);
+			if (!S.IsNull(ref buf, head, NullValue))
+				throw new InvalidOperationException("Written to occupied location " + head);
+#endif
+			buf[head]=value;
+			Head = buf.AddWrap(head,1);
+		}
+
+		public void Enqueue(ref TBuffer buf, RefAction<long, T> translator)
+		{
+			var head = Head;
+#if INLINEWAIT
+			if (buf.Subtract(BatchHead, head)==0)
+#endif
+				WaitForFreeSlots(ref buf);
+
+			var idx = buf.ToIndex(head);
+			translator(buf.ToLong(head), ref buf.Buffer[idx]);
+
+			Head = buf.AddWrap(head,1);
+		}
+
+	}
+		
+
+	[StructLayout(LayoutKind.Sequential, Pack = 8)]
+	public unsafe struct BQueueImpl<T, TBuffer, TSequence> 
+		where TBuffer:IBQueueBuffer<T,TSequence>
+		where TSequence:struct
+	{
+		// most readonly
+		public TBuffer Buffer;
+
+		public BQProducer<T, TBuffer, TSequence> P;
+		public BQConsumer<T, TBuffer, TSequence> C;
+		
+		public IntPtr HeadPtr
+		{
+			get { return Buffer.ToPointer(P.Head); }
+		}
+
+		public IntPtr TailPtr
+		{
+			get { return Buffer.ToPointer(C.Tail); }
+		}
+
+		public void Init(int capacity)
+		{
+			Buffer.Init(capacity);
+			P.Init(capacity);
+			C.Init(capacity);
 		}
 
 		public int Count
 		{
 			get
 			{
-				int count = (int)(_x.Head - _x.Tail);
-#if !POWER2BUFFER				
-				if(count<0)
-					count += _size;
-#endif
+				int count = Buffer.Subtract(P.Head, C.Tail);
 				return count;
 			}
 		}
 
-		public long NextSeq(long idx)
+		public bool TryEnqueue(T value, int ticksWait = BQWait.NoWait)
 		{
-#if POWER2BUFFER
-			return idx + 1;
-#else
-			return idx<_size-1 ? idx+1:0;
-#endif
-		}
-
-		public void FreeTail()
-		{
-			var tail = _x.Tail;
-			var idx = SeqToIdx(tail);
-			Helper.SetEmptyElement(ref _buffer[idx]);
-			tail = NextSeq(tail);
-			_x.Tail = tail;
-		}
-
-		public int WaitForFreeSlots(int batchSize = 1 , int ticksWait = BlockWait )
-		{
-			//var head = _x.Head;
-
-			//var batch_head = _x.BatchHead;
-			var size = Available;//(int)(batch_head - head);
-#if !POWER2BUFFER	
-			if (size < 0)
-				size += _size;
-#endif
-			if (size < batchSize)
-				RealWaitForFreeSlots(batchSize, ticksWait); 
-			
-			return size;
-		}
-
-
-
-		public int RealWaitForFreeSlots(int batchSize = 1, int ticksWait = BlockWait)
-		{
-			var head = _x.Head;
-			var batch_head = _x.BatchHead;
-
-			if (batchSize < _producerBatchSize)
-				batchSize = _producerBatchSize;
-			batch_head = head + batchSize;
-			var idx = SeqToIdx(batch_head);
-			if (Helper.IsNonEmptyElement(ref _buffer[idx]))
-			{
-#if STATS
-				_x.EnqueueFulls++;
-#endif
-				if (ticksWait != NoWait)
-				{
-					long start = DateTime.UtcNow.Ticks;
-					do
-					{
-						WaitTicks();
-						if (ticksWait > 0 && (int)(DateTime.UtcNow.Ticks - start) > ticksWait)
-						{
-							return 0;
-						}
-					} while (Helper.IsNonEmptyElement(ref _buffer[idx]));
-				}
-			}
-			_x.BatchHead = batch_head;
-			return (int)(batch_head - head);
+			return P.TryEnqueue(ref Buffer, value, ticksWait);
 		}
 
 		public void Enqueue(T value)
 		{
-			var head = _x.Head;
-			var batch_head = _x.BatchHead;
-			
-			if (head == batch_head)
-				RealWaitForFreeSlots();
-
-			_buffer[SeqToIdx(head)] = value;
-			
-			head = NextSeq(head);
-			_x.Head = head;
+			P.Enqueue(ref Buffer, value);
 		}
 
-		public void Enqueue(RefAction<long, T> translator)
+		public int WaitData(int ticksWait = BQWait.BlockWait)
 		{
-			var head = _x.Head;
-			var batch_head = _x.BatchHead;
-
-			if (head == batch_head)
-				RealWaitForFreeSlots();
-
-			translator(head, ref _buffer[SeqToIdx(head)]);
-			head = NextSeq(head);
-			_x.Head = head;
+			return C.WaitData(ref Buffer, ticksWait);
 		}
 
-		private int Backtracking()
+		public int SlotsAvailable
 		{
-		#if STATS			
-			_x._backtrackings++;
-		#endif
+			get { return P.GetSlotsAvailable(ref Buffer); }
+		}
 
-			var tail = _x.Tail;
-			var batch_tail = tail;
-			
-			batch_tail += _batch_history; 
-			//tmp_tail += _consumerBatchSize;
-	
-		#if ADAPTIVE
-			if (_batch_history < _consumerBatchSize)
-			{
-				_batch_history =
-					(_consumerBatchSize < (_batch_history + _batchIncrement)) ?
-					_consumerBatchSize : (_batch_history + _batchIncrement);
-			}
-		#endif
+		public void Write(T value)
+		{
+			P.Write(ref Buffer, value);
+		}
 
-			var batchSize = _batch_history;
-			var idx = SeqToIdx(batch_tail);
-
-			while ( !Helper.IsNonEmptyElement(ref _buffer[idx]) ) 
-			{
-				if (batchSize == 0)
-					return 0;
-				
-				//WaitTicks();
-
-				batchSize = batchSize >> 1;
-				batch_tail = tail + batchSize;
-				idx = SeqToIdx(batch_tail);
-			}
-		#if ADAPTIVE
-			_batch_history = batchSize;
-		#endif
+		public int BeginBatch(int batchSize, int ticksWait = BQWait.BlockWait)
+		{
+			return P.BeginBatch(ref Buffer, ticksWait);
+		}
 		
-			if ( batch_tail == tail )
-			{
-				batch_tail = NextSeq(batch_tail);
-			}
-			_x.BatchTail = batch_tail;
-			return (int)(batch_tail-tail);
-		}
-	
 
-		public int WaitForData(int ticksWait = BlockWait)
+		public bool TryDequeue(out T value, int ticksWait = BQWait.NoWait)
 		{
-			var tail = _x.Tail;
-			var batch_tail = _x.BatchTail;
-			var ready = (int)(batch_tail-tail);
-			if (ready == 0)
-				ready = RealWaitForData(ticksWait);
-			return ready;
-		}
-
-		public int RealWaitForData(int ticksWait)
-		{
-			int ready;
-			if ((ready = Backtracking()) == 0 && ticksWait != NoWait)
-			{
-				long start = DateTime.UtcNow.Ticks;
-				do
-				{
-					WaitTicks();
-					if (ticksWait > 0 && (int)(DateTime.UtcNow.Ticks - start) > ticksWait)
-					{
-						return 0;
-					}
-				} while ((ready = Backtracking()) == 0);
-			}
-			return ready;
-		}
-
-		public bool TryDequeue(out T value, int ticksWait = NoWait)
-		{
-			if (WaitForData(ticksWait) == 0)
-			{
-				value = default(T);
-				return false;
-			}
-
-			value = Dequeue();
-
-			return true; //SUCCESS
-		}
-	
-		public bool TryEnqueue(T value, int ticksWait = NoWait)
-		{
-			if(0==WaitForFreeSlots(1, ticksWait))
-				return false;
-			
-			Enqueue(value);
-			return true;
-		}
-
-		public bool TryEnqueue(RefAction<long, T> translator, int ticksWait = NoWait)
-		{
-			if (0 == WaitForFreeSlots(1, ticksWait))
-				return false;
-
-			Enqueue(translator);
-			return true;
+			return C.TryDequeue(ref Buffer, out value, ticksWait);
 		}
 
 		public T Dequeue()
 		{
-			var tail = _x.Tail;
-			var batch_tail = _x.BatchTail;
-			
-			if(tail==batch_tail)
-				WaitForData();
-
-			var idx = SeqToIdx(tail);
-			T value = _buffer[idx];
-
-			Helper.SetEmptyElement(ref _buffer[idx]);
-			tail = NextSeq(tail);
-			_x.Tail = tail;
-			return value;
+			return C.Dequeue(ref Buffer);
 		}
 
-	/*
-		public void Enqueue1(T value)
-		{
-			var head = Head.ReadUnfenced();
-			var batch_head = BatchHead.ReadUnfenced();
-			if (head == batch_head)
-			{
-				batch_head = head + _producerBatchSize;
-#if POWER2BUFFER
-				var idx = batch_head & _mask;
-
-#else
-				if (batch_head >= _size)
-					batch_head = 0;
-				var idx = batch_head;
-#endif
-#if STATS				
-				if (IsNotEmptyElement(ref _buffer[idx]))
-					EnqueueFulls.WriteUnfenced(EnqueueFulls.ReadUnfenced()+1);
-#endif
-				while (IsNotEmptyElement(ref _buffer[idx]))
-					WaitTicks();
-
-				//SpinWait.SpinUntil(()=>_buffer[batch_head]!=0);
-					
-				BatchHead.WriteUnfenced(batch_head);
-			}
-#if POWER2BUFFER
-			_buffer[head&_mask] = value;
-			head++;
-#else
-			_data[head] = value;
-			fehead++;
-			if (head >= _size)
-				head = 0;
-#endif
-			Head.WriteUnfenced(head);
-		}
-
-		public T Dequeue1()
-		{
-			var tail = Tail.ReadUnfenced();
-			var batch_tail = BatchTail.ReadUnfenced();
-			if (tail == batch_tail)
-			{
-				while (0==Backtracking())
-					WaitTicks();
-			}
-#if POWER2BUFFER
-			var idx = (int) tail & _mask;
-			var value = _buffer[idx];
-			SetEmptyElement(ref _buffer[idx]);
-			tail++;
-#else
-			var value = _data[tail];
-			SetEmptyElement(out _data[tail]);
-			tail++;
-			if (tail >= _size)
-				tail = 0;
-#endif
-			Tail.WriteUnfenced(tail);
-			return value;
-		}
-		*/
-
-		private List<T> ToList()
+		public List<T> ToList()
 		{
 			var list = new List<T>();
-			var tail = _x.Tail;
-			var head = _x.Head;
-			while(tail!=head)
+			var tail = C.Tail;
+			var head = P.Head;
+			while (Buffer.Subtract(tail, head)!=0)
 			{
-				list.Add(_buffer[SeqToIdx(tail)]);
-				tail = NextSeq(tail);
+				list.Add(Buffer[tail]);
+				tail = Buffer.AddWrap(tail,1);
 			}
 			return list;
+		}
+	}
+
+	public unsafe class BQueue<T, TBuffer, TSequence> : IProducerConsumerCollection<T> 
+		where TBuffer:IBQueueBuffer<T,TSequence>
+		where TSequence:struct
+	{
+		public const int DefaultCapacity = 64*1024;
+
+
+		public BQueueImpl<T, TBuffer, TSequence> Impl;// = default(BQueueImpl<TBuffer,TSequence>);
+
+		
+		public BQueue() : this(DefaultCapacity)
+		{
+		}
+		
+		public BQueue(int capacity)
+		{
+			Impl.Init(capacity);
+		}
+
+		public void Enqueue(T value)
+		{
+			Impl.Enqueue(value);
+		}
+
+		public T Dequeue()
+		{
+			return Impl.Dequeue();
+		}
+
+		public int Count
+		{
+			get { return Impl.Count; }
+		}
+
+		public BQueueStat GetQueueStats()
+		{
+			return new BQueueStat {Capacity = Impl.Buffer.Capacity, Count = Count, Backtrackings = Impl.C.Backtrackings, EnqueueFulls = Impl.P.EnqueueFulls};
 		}
 
 		IEnumerator<T> IEnumerable<T>.GetEnumerator()
 		{
-			return ToList().GetEnumerator();
+			return Impl.ToList().GetEnumerator();
 		}
 
 		IEnumerator IEnumerable.GetEnumerator()
 		{
-			return ToList().GetEnumerator();
+			return Impl.ToList().GetEnumerator();
 		}
 
 		void ICollection.CopyTo(Array array, int index)
 		{
-			ToList().CopyTo((T[])array,index);
+			Impl.ToList().CopyTo((T[])array, index);
 		}
 
 		object ICollection.SyncRoot
@@ -600,28 +1037,61 @@ namespace Snail.Threading
 
 		void IProducerConsumerCollection<T>.CopyTo(T[] array, int index)
 		{
-			ToList().CopyTo(array,index);
+			Impl.ToList().CopyTo(array, index);
 		}
 
 		bool IProducerConsumerCollection<T>.TryAdd(T item)
 		{
-			return TryEnqueue(item);
+			return Impl.TryEnqueue(item);
 		}
 
 		bool IProducerConsumerCollection<T>.TryTake(out T item)
 		{
-			return TryDequeue(out item);
+			return Impl.TryDequeue(out item);
 		}
 
 		T[] IProducerConsumerCollection<T>.ToArray()
 		{
 			var cnt = this.Count;
 			T[] array = new T[cnt];
-			ToList().CopyTo(array, 0);
+			Impl.ToList().CopyTo(array, 0);
 			return array;
 		}
 	}
 
+	public class BQueue<T, TNullValue> : BQueue<T, BRingBuffer<T,TNullValue>, int>
+		where TNullValue : struct,INullValue<T>
+	{
+		public BQueue(int capacity)
+			: base(capacity)
+		{
 
-	
+		}
+	}
+
+	public class BQueue<T> : BQueue<T,NullValue<T>>
+	{
+		public BQueue(int capacity)
+			: base(capacity)
+		{
+
+		}
+	}
+
+	public class BQueueStat
+	{
+		public long Count;
+		public long Capacity;
+		public long Backtrackings;
+		public long EnqueueFulls;
+
+		public override string ToString()
+		{
+			var sb = new StringBuilder();
+			sb.AppendFormat("Queue Filled {0}/{1}", Count, Capacity);
+			sb.AppendFormat(", Backtracks {0} {1:F4}%", Backtrackings, (double)100 * Backtrackings / Capacity);
+			sb.AppendFormat(", EnqFulls {0} {1:F4}", EnqueueFulls, (double)100 * EnqueueFulls / Capacity);
+			return sb.ToString();
+		}
+	}
 }

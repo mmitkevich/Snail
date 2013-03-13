@@ -43,8 +43,12 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Collections\StructArray.cs" />
     <Compile Include="Compression\CompressionHelper.cs" />
     <Compile Include="Compression\DiffBlock.cs" />
+    <Compile Include="Threading\ArgsBuffer.cs">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="Threading\Disruptor\LeastLoadedResourceStrategy.cs" />
     <Compile Include="Threading\Disruptor\ResourceStrategy.cs" />
     <Compile Include="Threading\FixedArgs.cs" />
@@ -56,7 +60,6 @@
     <Compile Include="Util\BitMagic.cs" />
     <Compile Include="Events\OrderEvent.cs" />
     <Compile Include="Threading\Actor.cs" />
-    <Compile Include="Threading\ArgsBuffer.cs" />
     <Compile Include="Threading\BQueue.cs" />
     <Compile Include="Util\MicroLog.cs" />
     <Compile Include="Threading\Disruptor\MultiDisruptor.cs" />
@@ -81,6 +84,7 @@
       <Name>Disruptor.Scheduler</Name>
     </ProjectReference>
   </ItemGroup>
+  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>set target=$(TargetPath)

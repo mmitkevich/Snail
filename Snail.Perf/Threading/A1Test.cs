@@ -2,7 +2,7 @@
 using System.Threading;
 using Snail.Threading.A1;
 
-namespace Snail.Tests.Threading
+namespace Snail.Tests.Threading.A1
 {
 	class A1Test
 	{
